@@ -448,12 +448,16 @@ func (s *ModService) SubscribeModByModId(clusterName, modId, lang string) (*mode
 	return newModInfo, err
 }
 
-// GetMyModList 获取已订阅的模组列表
-func (s *ModService) GetMyModList() ([]model.ModInfo, error) {
+// GetMyModList 合并面板订阅记录和服务器已经安装的模组，不写入数据库或游戏文件。
+func (s *ModService) GetMyModList(clusterName, lang string) ([]model.ModInfo, error) {
 	var modInfos []model.ModInfo
 	err := s.db.Find(&modInfos).Error
 	if err != nil {
 		return modInfos, err
+	}
+	modInfos, err = s.mergeInstalledMods(clusterName, lang, modInfos)
+	if err != nil {
+		return nil, err
 	}
 	authorIDs := make([]string, 0, len(modInfos))
 	for _, modInfo := range modInfos {

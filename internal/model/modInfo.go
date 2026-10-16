@@ -16,4 +16,5 @@ type ModInfo struct {
 	Name          string  `json:"name"`
 	V             string  `json:"v"`
 	Update        bool    `json:"update"`
+	Installed     bool    `gorm:"-" json:"installed"`
 }

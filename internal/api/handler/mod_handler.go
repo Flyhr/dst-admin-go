@@ -120,7 +120,7 @@ func (h *ModHandler) GetModInfo(ctx *gin.Context) {
 // @Success 200 {object} response.Response
 // @Router /api/mod [get]
 func (h *ModHandler) GetMyModList(ctx *gin.Context) {
-	modInfos, err := h.modService.GetMyModList()
+	modInfos, err := h.modService.GetMyModList(context.GetClusterName(ctx), ctx.DefaultQuery("lang", "zh"))
 	if err != nil {
 		response.FailWithMessage("获取模组列表失败: "+err.Error(), ctx)
 		return
@@ -144,6 +144,7 @@ func (h *ModHandler) GetMyModList(ctx *gin.Context) {
 			"v":             modinfo.V,
 			"mod_config":    modConfig,
 			"update":        modinfo.Update,
+			"installed":     modinfo.Installed,
 		}
 		modDataList = append(modDataList, modData)
 	}
