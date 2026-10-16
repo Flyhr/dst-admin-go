@@ -24,11 +24,12 @@ func NewPlayerHandler(playerService *player.PlayerService, gameProcess game.Proc
 func (p *PlayerHandler) GetPlayerList(ctx *gin.Context) {
 
 	clusterName := context.GetClusterName(ctx)
+	levelName := ctx.DefaultQuery("levelName", "Master")
 
 	ctx.JSON(http.StatusOK, gin.H{
 		"code": 200,
 		"msg":  "success",
-		"data": p.playerService.GetPlayerList(clusterName, "Master", p.gameProcess),
+		"data": p.playerService.GetPlayerList(clusterName, levelName, p.gameProcess),
 	})
 }
 
