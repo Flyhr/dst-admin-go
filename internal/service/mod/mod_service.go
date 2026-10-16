@@ -604,68 +604,33 @@ func (s *ModService) AddModInfo(clusterName, lang, modid, modinfo, modDownloadPa
 // GetUgcModInfo 获取UGC模组信息
 func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopItemDetail, error) {
 	acfPath := s.pathResolver.GetUgcAcfPath(clusterName, levelName)
-	acfWorkshops := s.parseACFFile(acfPath)
-
-	var workshopItemDetails []WorkshopItemDetail
-	var modIds []string
-	for key := range acfWorkshops {
-		modIds = append(modIds, key)
+	installed := s.parseACFFile(acfPath)
+	details := make([]WorkshopItemDetail, 0, len(installed))
+	modIDs := make([]string, 0, len(installed))
+	indexes := make(map[string]int, len(installed))
+	for id, item := range installed {
+		indexes[id] = len(details)
+		modIDs = append(modIDs, id)
+		details = append(details, WorkshopItemDetail{
+			WorkShopId: id, Name: id, Timeupdated: item.TimeUpdated,
+		})
 	}
-
-	urlStr := "http://api.steampowered.com/IPublishedFileService/GetDetails/v1/"
-	data := url.Values{}
-	data.Set("key", steamAPIKey)
-	data.Set("language", "6")
-	for i := range modIds {
-		data.Set("publishedfileids["+strconv.Itoa(i)+"]", modIds[i])
+	if len(modIDs) == 0 {
+		return details, nil
 	}
-	urlStr = urlStr + "?" + data.Encode()
-
-	req, err := http.NewRequest("GET", urlStr, nil)
+	// Installed files remain visible when Steam metadata is temporarily unavailable.
+	published, err := s.getPublishedFileDetailsBatched(modIDs, 20)
 	if err != nil {
-		return nil, err
+		return details, nil
 	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	if err != nil {
-		return nil, err
-	}
-
-	dataList, ok := result["response"].(map[string]interface{})["publishedfiledetails"].([]interface{})
-	if !ok {
-		return nil, errors.New("解析响应失败")
-	}
-
-	for i := range dataList {
-		workshop := dataList[i].(map[string]interface{})
-		_, find := workshop["time_updated"]
-		if find {
-			timeUpdated := workshop["time_updated"].(float64)
-			modId := workshop["publishedfileid"].(string)
-			value, ok := acfWorkshops[modId]
-			if ok {
-				img := workshop["preview_url"].(string)
-				img = fmt.Sprintf("%s?imw=64&imh=64&ima=fit&impolicy=Letterbox&imcolor=%%23000000&letterbox=true", img)
-				workshopItemDetails = append(workshopItemDetails, WorkshopItemDetail{
-					WorkShopId:  modId,
-					Timeupdated: value.TimeUpdated,
-					Timelast:    timeUpdated,
-					Img:         img,
-					Name:        workshop["title"].(string),
-				})
-			}
+	for _, item := range published {
+		if index, ok := indexes[item.Publishedfileid]; ok {
+			details[index].Name = item.Title
+			details[index].Img = item.PreviewURL
+			details[index].Timelast = item.TimeUpdated
 		}
 	}
-
-	return workshopItemDetails, nil
+	return details, nil
 }
 
 // DeleteUgcModFile 删除UGC模组文件
@@ -1169,7 +1134,7 @@ func (s *ModService) getPublishedFileDetailsBatched(workshopIds []string, batchS
 
 // getPublishedFileDetailsWithGet 通过GET方式获取mod详情
 func (s *ModService) getPublishedFileDetailsWithGet(workshopIds []string) ([]Publishedfiledetail, error) {
-	urlStr := "http://api.steampowered.com/IPublishedFileService/GetDetails/v1/"
+	urlStr := "https://api.steampowered.com/IPublishedFileService/GetDetails/v1/"
 	data := url.Values{}
 	data.Set("key", steamAPIKey)
 	data.Set("language", "6")
@@ -1183,7 +1148,7 @@ func (s *ModService) getPublishedFileDetailsWithGet(workshopIds []string) ([]Pub
 		return nil, err
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 10 * time.Second}
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
