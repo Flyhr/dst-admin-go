@@ -5,8 +5,10 @@ import (
 	"dst-admin-go/internal/pkg/utils/shellUtils"
 	"dst-admin-go/internal/service/dstConfig"
 	"dst-admin-go/internal/service/levelConfig"
+	"fmt"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -93,10 +95,7 @@ func (p *LinuxProcess) shutdownLevel(clusterName, levelName string) error {
 	if !ok {
 		return nil
 	}
-	shell := "screen -S \"" + p.SessionName(clusterName, levelName) + "\" -p 0 -X stuff \"c_shutdown(true)\\n\""
-	log.Println("正在shutdown世界", "cluster: ", clusterName, "level: ", levelName, "command: ", shell)
-	_, err = shellUtils.Shell(shell)
-	return err
+	return p.Command(clusterName, levelName, "c_shutdown(true)")
 }
 
 func (p *LinuxProcess) killLevel(clusterName, level string) error {
@@ -118,26 +117,20 @@ func (p *LinuxProcess) Stop(clusterName, levelName string) error {
 
 // stop 内部实现，不加锁，供 Start 等方法内部调用
 func (p *LinuxProcess) stop(clusterName, levelName string) error {
-	p.shutdownLevel(clusterName, levelName)
-	time.Sleep(3 * time.Second)
-
-	if ok, err := p.Status(clusterName, levelName); err == nil && ok {
-		var i uint8 = 1
-		for {
-			if ok, err := p.Status(clusterName, levelName); err == nil && ok {
-				break
-			}
-			p.shutdownLevel(clusterName, levelName)
-			log.Println("正在第", i, "次stop世界", "cluster: ", clusterName, "level: ", levelName)
-			time.Sleep(1 * time.Second)
-			i++
-			if i > 3 {
-				break
-			}
-		}
+	if err := p.shutdownLevel(clusterName, levelName); err != nil {
+		return err
 	}
-	log.Println("使用kill命令强制结束世界", "cluster: ", clusterName, "level: ", levelName)
-	return p.killLevel(clusterName, levelName)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		ok, err := p.Status(clusterName, levelName)
+		if err != nil || !ok {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("世界 %s 保存退出超时，请检查日志；进程未被强制结束", levelName)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func (p *LinuxProcess) StartAll(clusterName string) error {
@@ -209,16 +202,51 @@ func (p *LinuxProcess) stopAll(clusterName string) error {
 }
 
 func (p *LinuxProcess) Status(clusterName, levelName string) (bool, error) {
-	cmd := " ps -ef | grep -v grep | grep -v tail |grep '" + clusterName + "'|grep " + levelName + " |sed -n '1P'|awk '{print $2}' "
-	result, err := shellUtils.Shell(cmd)
+	result, err := exec.Command("pgrep", "-af", "[d]ontstarve_dedicated_server_nullrenderer").Output()
 	if err != nil {
-		return false, nil
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
 	}
-	res := strings.Split(result, "\n")[0]
-	return res != "", nil
+	for _, line := range strings.Split(string(result), "\n") {
+		if matchesGameProcess(line, clusterName, levelName) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func matchesGameProcess(line, clusterName, levelName string) bool {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || !strings.HasPrefix(filepath.Base(fields[1]), "dontstarve_dedicated_server_nullrenderer") {
+		return false
+	}
+	cluster, shard := "", ""
+	for i := 2; i+1 < len(fields); i++ {
+		switch fields[i] {
+		case "-cluster":
+			cluster = fields[i+1]
+		case "-shard":
+			shard = fields[i+1]
+		}
+	}
+	return cluster == clusterName && shard == levelName
 }
 
 func (p *LinuxProcess) Command(clusterName, levelName, command string) error {
+	// Existing manually started servers can stay in their current tmux sessions.
+	for _, session := range []string{p.SessionName(clusterName, levelName), "dst-" + strings.ToLower(levelName)} {
+		startup, err := exec.Command("tmux", "display-message", "-p", "-t", session+":0.0", "#{pane_start_command}").Output()
+		padded := " " + string(startup) + " "
+		if err != nil || !strings.Contains(padded, " -cluster "+clusterName+" ") || !strings.Contains(padded, " -shard "+levelName+" ") {
+			continue
+		}
+		if err := exec.Command("tmux", "send-keys", "-t", session+":0.0", "-l", "--", command).Run(); err != nil {
+			return err
+		}
+		return exec.Command("tmux", "send-keys", "-t", session+":0.0", "Enter").Run()
+	}
 	// Do not route remote console commands through `sh -c`: panel commands often
 	// contain Lua string quotes (for example c_give("cutgrass", 1)).  Shell
 	// parsing strips or reinterprets those quotes before `screen` receives them,
