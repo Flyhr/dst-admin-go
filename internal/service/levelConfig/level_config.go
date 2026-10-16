@@ -84,7 +84,7 @@ func NewLevelConfigUtils(archive *archive.PathResolver) *LevelConfigUtils {
 
 func (p *LevelConfigUtils) initLevel(levelFolderPath string, level *LevelInfo) {
 
-	lPath := filepath.Join(levelFolderPath, "leveldataoverride.lua")
+	lPath := archive.WorldOverridePath(levelFolderPath)
 	mPath := filepath.Join(levelFolderPath, "modoverrides.lua")
 	sPath := filepath.Join(levelFolderPath, "server.ini")
 

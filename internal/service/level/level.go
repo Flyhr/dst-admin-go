@@ -112,8 +112,8 @@ func (l *LevelService) GetLevel(clusterName string, levelName string) levelConfi
 		}
 	}
 
-	// 读取 leveldataoverride.lua
-	lPath := filepath.Join(levelFolderPath, "leveldataoverride.lua")
+	// 沿用现有世界实际使用的覆盖文件。
+	lPath := l.resolver.LeveldataoverridePath(clusterName, levelName)
 	leveldataoverride, err := fileUtils.ReadFile(lPath)
 	if err != nil {
 		leveldataoverride = "return {}"
@@ -278,7 +278,7 @@ func (l *LevelService) DeleteLevel(clusterName string, levelName string) error {
 // initLevel 初始化关卡文件
 func (l *LevelService) initLevel(levelFolderPath string, level *levelConfig.LevelInfo) {
 
-	lPath := filepath.Join(levelFolderPath, "leveldataoverride.lua")
+	lPath := archive.WorldOverridePath(levelFolderPath)
 	mPath := filepath.Join(levelFolderPath, "modoverrides.lua")
 	sPath := filepath.Join(levelFolderPath, "server.ini")
 

@@ -119,7 +119,20 @@ func (r *PathResolver) ModoverridesPath(clusterName, levelName string) string {
 }
 
 func (r *PathResolver) LeveldataoverridePath(clusterName, levelName string) string {
-	return filepath.Join(r.KleiBasePath(clusterName), clusterName, levelName, "leveldataoverride.lua")
+	return WorldOverridePath(r.LevelPath(clusterName, levelName))
+}
+
+// Keep editing the override file an existing world already uses.
+func WorldOverridePath(levelPath string) string {
+	legacy := filepath.Join(levelPath, "leveldataoverride.lua")
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	worldgen := filepath.Join(levelPath, "worldgenoverride.lua")
+	if _, err := os.Stat(worldgen); err == nil {
+		return worldgen
+	}
+	return legacy
 }
 
 func (r *PathResolver) ServerIniPath(clusterName string, levelName string) string {
