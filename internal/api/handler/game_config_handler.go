@@ -31,7 +31,20 @@ func (p *GameConfigHandler) RegisterRoute(router *gin.RouterGroup) {
 	router.POST("/api/game/8level/whitelist", p.SaveWhithList)
 
 	router.GET("/api/game/config", p.GetConfig)
+	router.GET("/api/game/config/inspect", p.InspectClusterConfig)
 	router.POST("/api/game/config", p.SaveConfig)
+}
+
+func (p *GameConfigHandler) InspectClusterConfig(ctx *gin.Context) {
+	view, err := p.gameConfig.InspectClusterConfig(context.GetClusterName(ctx))
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, response.Response{
+			Code: http.StatusBadRequest,
+			Msg:  "无法读取集群配置: " + err.Error(),
+		})
+		return
+	}
+	ctx.JSON(http.StatusOK, response.Response{Code: http.StatusOK, Msg: "success", Data: view})
 }
 
 // GetClusterIni 获取房间 cluster.ini 配置 swagger 注释
