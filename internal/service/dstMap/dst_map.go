@@ -6,9 +6,10 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"io/ioutil"
 	"os"
-	"regexp"
+	"strconv"
+
+	"github.com/yuin/gopher-lua/ast"
 )
 
 // Color 定义一个RGB颜色
@@ -124,19 +125,17 @@ func NewDSTMapGenerator() *DSTMapGenerator {
 
 // ReadSaveFile 读取存档文件
 func (g *DSTMapGenerator) ReadSaveFile(filePath string) (string, error) {
-	content, err := ioutil.ReadFile(filePath)
+	table, err := readWorldMap(filePath)
 	if err != nil {
 		return "", fmt.Errorf("读取文件失败: %v", err)
 	}
 
-	// 使用正则表达式提取地图数据
-	re := regexp.MustCompile(`tiles="([^"]+)"`)
-	matches := re.FindSubmatch(content)
-	if len(matches) < 2 {
+	tiles, ok := worldMapField(table, "tiles").(*ast.StringExpr)
+	if !ok || tiles.Value == "" {
 		return "", fmt.Errorf("无法在存档中找到地图数据")
 	}
 
-	base64Data := string(matches[1])
+	base64Data := tiles.Value
 	fmt.Printf("提取的base64数据长度: %d\n", len(base64Data))
 	return base64Data, nil
 }
@@ -297,35 +296,22 @@ func (g *DSTMapGenerator) GenerateMap(saveFilePath, outputPath string, width, he
 
 // ExtractDimensions 从文件中读取并提取 height 和 width
 func ExtractDimensions(filePath string) (int, int, error) {
-	// 读取文件内容
-	data, err := ioutil.ReadFile(filePath)
+	table, err := readWorldMap(filePath)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	// 将文件内容转换为字符串
-	input := string(data)
-
-	// 定义正则表达式
-	heightRegex := regexp.MustCompile(`height=(\d+)`)
-	widthRegex := regexp.MustCompile(`width=(\d+)`)
-
-	// 查找匹配
-	heightMatch := heightRegex.FindStringSubmatch(input)
-	widthMatch := widthRegex.FindStringSubmatch(input)
-
-	// 返回结果
-	var height, width int
-	if len(heightMatch) > 1 {
-		fmt.Sscanf(heightMatch[1], "%d", &height)
-	} else {
-		height = 0 // 未找到时返回 0
+	dimension := func(name string) int {
+		if number, ok := worldMapField(table, name).(*ast.NumberExpr); ok {
+			if value, err := strconv.Atoi(number.Value); err == nil {
+				return value
+			}
+		}
+		return 0
 	}
-
-	if len(widthMatch) > 1 {
-		fmt.Sscanf(widthMatch[1], "%d", &width)
-	} else {
-		width = 0 // 未找到时返回 0
+	height, width := dimension("height"), dimension("width")
+	if height <= 0 || width <= 0 {
+		return 0, 0, fmt.Errorf("地图宽高缺失或无效: width=%d height=%d", width, height)
 	}
 
 	return height, width, nil
@@ -343,8 +329,8 @@ func main() {
 	err = generator.GenerateMap(
 		filePath,
 		"dst_map.png",
-		height, // 指定宽度
-		width,  // 指定高度
+		width,
+		height,
 	)
 	if err != nil {
 		fmt.Printf("生成地图时出错: %v\n", err)

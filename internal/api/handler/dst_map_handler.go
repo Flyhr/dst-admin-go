@@ -72,8 +72,8 @@ func (d *DstMapHandler) GenDstMap(ctx *gin.Context) {
 	err = d.generator.GenerateMap(
 		filePath,
 		outputImage,
-		height,
 		width,
+		height,
 	)
 	if err != nil {
 		log.Panicln(err)
