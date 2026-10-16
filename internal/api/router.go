@@ -19,6 +19,7 @@ import (
 	"dst-admin-go/internal/service/player"
 	"dst-admin-go/internal/service/schedule"
 	"dst-admin-go/internal/service/update"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/sessions"
@@ -69,6 +70,10 @@ func RegisterStaticFile(app *gin.Engine) {
 		}
 	}()
 	app.Use(func(context *gin.Context) {
+		if strings.HasPrefix(context.Request.URL.Path, "/api/") {
+			context.Header("Cache-Control", "no-store")
+			return
+		}
 		context.Writer.Header().Set("Cache-Control", "public, max-age=30672000")
 	})
 	app.LoadHTMLGlob("dist/index.html") // 添加入口index.html
