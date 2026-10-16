@@ -1,7 +1,6 @@
 package gameConfig
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -82,29 +81,39 @@ func readInspectionFile(path string) ([]byte, error) {
 }
 
 func redactInspectionINI(content []byte) (string, bool, error) {
-	cfg, err := ini.LoadSources(ini.LoadOptions{AllowShadows: true}, content)
+	_, err := ini.LoadSources(ini.LoadOptions{AllowShadows: true}, content)
 	if err != nil {
 		return "", false, err
 	}
+	var output strings.Builder
 	redacted := false
-	for _, section := range cfg.Sections() {
-		names := append([]string(nil), section.KeyStrings()...)
-		for _, name := range names {
-			switch strings.ToLower(name) {
+	secretContinues := false
+	tripleQuoted := false
+	for _, part := range strings.SplitAfter(string(content), "\n") {
+		if part == "" {
+			continue
+		}
+		line := strings.TrimSuffix(strings.TrimSuffix(part, "\n"), "\r")
+		ending := part[len(line):]
+		if secretContinues {
+			// Never show the body of triple-quoted or backslash-continued secrets.
+			secretContinues = (tripleQuoted && !strings.Contains(line, `"""`)) || (!tripleQuoted && hasINIContinuation(line))
+			output.WriteString(ending)
+			continue
+		}
+		equal := strings.IndexByte(line, '=')
+		if equal >= 0 {
+			switch strings.ToLower(strings.TrimSpace(line[:equal])) {
 			case "cluster_password", "cluster_key", "cluster_token":
-				// Recreate the key so duplicate and multiline values are also removed.
-				section.DeleteKey(name)
-				if _, err := section.NewKey(name, "[已隐藏]"); err != nil {
-					return "", false, err
-				}
+				value := strings.TrimSpace(line[equal+1:])
+				tripleQuoted = strings.HasPrefix(value, `"""`)
+				secretContinues = (tripleQuoted && strings.Count(value, `"""`) == 1) || (!tripleQuoted && hasINIContinuation(value))
+				output.WriteString(line[:equal+1] + " [已隐藏]" + ending)
 				redacted = true
+				continue
 			}
 		}
+		output.WriteString(part)
 	}
-	if !redacted {
-		return string(content), false, nil
-	}
-	var output bytes.Buffer
-	_, err = cfg.WriteTo(&output)
-	return output.String(), true, err
+	return output.String(), redacted, nil
 }

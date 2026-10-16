@@ -4,8 +4,10 @@ import (
 	"dst-admin-go/internal/pkg/context"
 	"dst-admin-go/internal/pkg/response"
 	"dst-admin-go/internal/service/gameConfig"
+	"errors"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/gin-gonic/gin"
 )
@@ -32,7 +34,43 @@ func (p *GameConfigHandler) RegisterRoute(router *gin.RouterGroup) {
 
 	router.GET("/api/game/config", p.GetConfig)
 	router.GET("/api/game/config/inspect", p.InspectClusterConfig)
+	router.GET("/api/game/config/cluster-name", p.GetClusterName)
+	router.PUT("/api/game/config/cluster-name", p.SaveClusterName)
 	router.POST("/api/game/config", p.SaveConfig)
+}
+
+func (p *GameConfigHandler) GetClusterName(ctx *gin.Context) {
+	name, err := p.gameConfig.GetClusterName(context.GetClusterName(ctx))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		ctx.JSON(status, response.Response{Code: status, Msg: err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, response.Response{Code: http.StatusOK, Msg: "success", Data: gin.H{"cluster_name": name}})
+}
+
+func (p *GameConfigHandler) SaveClusterName(ctx *gin.Context) {
+	var payload struct {
+		ClusterName string `json:"cluster_name"`
+	}
+	if err := ctx.ShouldBindJSON(&payload); err != nil {
+		ctx.JSON(http.StatusBadRequest, response.Response{Code: http.StatusBadRequest, Msg: "请求体无效，需要 cluster_name 字符串"})
+		return
+	}
+	if err := p.gameConfig.SaveClusterName(context.GetClusterName(ctx), payload.ClusterName); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, gameConfig.ErrInvalidClusterName) {
+			status = http.StatusBadRequest
+		} else if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		}
+		ctx.JSON(status, response.Response{Code: status, Msg: err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, response.Response{Code: http.StatusOK, Msg: "success"})
 }
 
 func (p *GameConfigHandler) InspectClusterConfig(ctx *gin.Context) {
