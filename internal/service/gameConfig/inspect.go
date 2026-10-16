@@ -87,28 +87,23 @@ func redactInspectionINI(content []byte) (string, bool, error) {
 	}
 	var output strings.Builder
 	redacted := false
-	secretContinues := false
-	tripleQuoted := false
+	var secretState iniLineState
 	for _, part := range strings.SplitAfter(string(content), "\n") {
 		if part == "" {
 			continue
 		}
 		line := strings.TrimSuffix(strings.TrimSuffix(part, "\n"), "\r")
 		ending := part[len(line):]
-		if secretContinues {
-			// Never show the body of triple-quoted or backslash-continued secrets.
-			secretContinues = (tripleQuoted && !strings.Contains(line, `"""`)) || (!tripleQuoted && hasINIContinuation(line))
+		if secretState.skips(line) {
 			output.WriteString(ending)
 			continue
 		}
-		equal := strings.IndexByte(line, '=')
-		if equal >= 0 {
-			switch strings.ToLower(strings.TrimSpace(line[:equal])) {
+		prefix, key, _, ok := iniKeyValue(line)
+		if ok {
+			switch strings.ToLower(key) {
 			case "cluster_password", "cluster_key", "cluster_token":
-				value := strings.TrimSpace(line[equal+1:])
-				tripleQuoted = strings.HasPrefix(value, `"""`)
-				secretContinues = (tripleQuoted && strings.Count(value, `"""`) == 1) || (!tripleQuoted && hasINIContinuation(value))
-				output.WriteString(line[:equal+1] + " [已隐藏]" + ending)
+				secretState.observe(line)
+				output.WriteString(prefix + "[已隐藏]" + ending)
 				redacted = true
 				continue
 			}

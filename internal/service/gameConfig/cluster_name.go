@@ -10,7 +10,7 @@ import (
 	"unicode/utf8"
 )
 
-var ErrInvalidClusterName = errors.New("房间名称不能为空、超过 100 个字符或包含控制字符")
+var ErrInvalidClusterName = errors.New("房间名称不能为空、超过 100 个字符、包含控制字符或使用多行续行写法")
 
 func (p *GameConfig) GetClusterName(clusterName string) (string, error) {
 	return readClusterNameFile(p.archive.ClusterIniPath(clusterName))
@@ -63,7 +63,10 @@ func saveClusterNameFile(path, name string) error {
 	if !info.Mode().IsRegular() {
 		return errors.New("cluster.ini 不是普通文件")
 	}
-	updated := replaceClusterName(string(original), name)
+	updated, err := replaceClusterName(string(original), name)
+	if err != nil {
+		return err
+	}
 	if updated == string(original) {
 		return nil
 	}
@@ -86,11 +89,13 @@ func validClusterName(name string) bool {
 			return false
 		}
 	}
-	return true
+	var state iniLineState
+	state.observe("cluster_name = " + name)
+	return state.quote == "" && !state.continued
 }
 
 func iniSectionName(line string) (string, bool) {
-	trimmed := strings.TrimSpace(line)
+	trimmed := strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
 	if !strings.HasPrefix(trimmed, "[") {
 		return "", false
 	}
@@ -102,25 +107,64 @@ func iniSectionName(line string) (string, bool) {
 }
 
 func clusterNameLine(line string) (string, string, bool) {
-	equal := strings.IndexByte(line, '=')
-	if equal < 0 || !strings.EqualFold(strings.TrimSpace(line[:equal]), "cluster_name") {
+	prefix, key, value, ok := iniKeyValue(line)
+	if !ok || !strings.EqualFold(key, "cluster_name") {
 		return "", "", false
 	}
-	prefixEnd := equal + 1
+	return prefix, value, true
+}
+
+// Return the original prefix so editing one value preserves its key and spacing.
+func iniKeyValue(line string) (prefix, key, value string, ok bool) {
+	trimmed := strings.TrimLeftFunc(strings.TrimPrefix(line, "\ufeff"), unicode.IsSpace)
+	if trimmed == "" || strings.ContainsRune(";#[", rune(trimmed[0])) {
+		return "", "", "", false
+	}
+	start := len(line) - len(trimmed)
+	quote := ""
+	if strings.HasPrefix(trimmed, `"""`) {
+		quote = `"""`
+	} else if trimmed[0] == '"' || trimmed[0] == '`' {
+		quote = trimmed[:1]
+	}
+	delimiter := -1
+	if quote != "" {
+		end := strings.Index(trimmed[len(quote):], quote)
+		if end < 0 {
+			return "", "", "", false
+		}
+		key = trimmed[len(quote) : len(quote)+end]
+		after := len(quote)*2 + end
+		rest := strings.TrimLeftFunc(trimmed[after:], unicode.IsSpace)
+		if rest != "" && (rest[0] == '=' || rest[0] == ':') {
+			delimiter = len(trimmed) - len(rest)
+		}
+	} else {
+		delimiter = strings.IndexAny(trimmed, "=:")
+		if delimiter >= 0 {
+			key = strings.TrimSpace(trimmed[:delimiter])
+		}
+	}
+	if delimiter < 0 || key == "" {
+		return "", "", "", false
+	}
+	prefixEnd := start + delimiter + 1
 	for prefixEnd < len(line) && (line[prefixEnd] == ' ' || line[prefixEnd] == '\t') {
 		prefixEnd++
 	}
-	return line[:prefixEnd], line[prefixEnd:], true
+	return line[:prefixEnd], key, line[prefixEnd:], true
 }
 
 type iniLineState struct {
-	tripleQuoted bool
-	continued    bool
+	quote     string
+	continued bool
 }
 
 func (s *iniLineState) skips(line string) bool {
-	if s.tripleQuoted {
-		s.tripleQuoted = !strings.Contains(line, `"""`)
+	if s.quote != "" {
+		if strings.Contains(line, s.quote) {
+			s.quote = ""
+		}
 		return true
 	}
 	if s.continued {
@@ -131,24 +175,27 @@ func (s *iniLineState) skips(line string) bool {
 }
 
 func (s *iniLineState) observe(line string) {
-	equal := strings.IndexByte(line, '=')
-	if equal < 0 {
+	_, _, value, ok := iniKeyValue(line)
+	if !ok {
 		return
 	}
-	key := strings.TrimSpace(line[:equal])
-	if key == "" || strings.HasPrefix(key, ";") || strings.HasPrefix(key, "#") {
-		return
+	value = strings.TrimSpace(value)
+	for _, quote := range []string{`"""`, "`"} {
+		if strings.HasPrefix(value, quote) {
+			if !strings.Contains(value[len(quote):], quote) {
+				s.quote = quote
+			}
+			return
+		}
 	}
-	value := strings.TrimSpace(line[equal+1:])
-	s.tripleQuoted = strings.HasPrefix(value, `"""`) && strings.Count(value, `"""`) == 1
-	s.continued = !s.tripleQuoted && hasINIContinuation(value)
+	s.continued = hasINIContinuation(value)
 }
 
 func hasINIContinuation(value string) bool {
 	return strings.HasSuffix(strings.TrimRight(value, " \t"), "\\")
 }
 
-func replaceClusterName(content, name string) string {
+func replaceClusterName(content, name string) (string, error) {
 	newline := "\n"
 	if strings.Contains(content, "\r\n") {
 		newline = "\r\n"
@@ -180,6 +227,10 @@ func replaceClusterName(content, name string) string {
 		}
 		if section == "NETWORK" {
 			if prefix, _, ok := clusterNameLine(line); ok {
+				state.observe(line)
+				if state.quote != "" || state.continued {
+					return "", errors.New("现有房间名称使用多行写法，请先在文本编辑器中改为单行；原文件未修改")
+				}
 				part = prefix + name + ending
 				nameFound = true
 			}
@@ -196,7 +247,7 @@ func replaceClusterName(content, name string) string {
 		}
 		out.WriteString("cluster_name = " + name + newline)
 	}
-	return out.String()
+	return out.String(), nil
 }
 
 func writeTemporaryReplacement(target string, content []byte, mode os.FileMode) error {
