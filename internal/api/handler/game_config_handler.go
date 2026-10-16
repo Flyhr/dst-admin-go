@@ -122,7 +122,12 @@ func (p *GameConfigHandler) GetClusterIni(ctx *gin.Context) {
 // @Router /api/game/config/clusterIni [post]
 func (p *GameConfigHandler) SaveClusterIni(ctx *gin.Context) {
 	clusterName := context.GetClusterName(ctx)
-	var config gameConfig.ClusterIniConfig
+	// Bind submitted fields onto the current settings, preserving omitted fields.
+	config, err := p.gameConfig.GetClusterIniConfig(clusterName)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, response.Response{Code: 500, Msg: "读取现有房间配置失败: " + err.Error()})
+		return
+	}
 	if err := ctx.ShouldBindJSON(&config); err != nil {
 		ctx.JSON(400, response.Response{
 			Code: http.StatusBadRequest,
@@ -131,7 +136,7 @@ func (p *GameConfigHandler) SaveClusterIni(ctx *gin.Context) {
 		})
 		return
 	}
-	err := p.gameConfig.SaveClusterIniConfig(clusterName, &config)
+	err = p.gameConfig.SaveClusterIniConfig(clusterName, &config)
 	if err != nil {
 		ctx.JSON(500, response.Response{
 			Code: http.StatusInternalServerError,

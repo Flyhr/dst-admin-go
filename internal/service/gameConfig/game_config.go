@@ -1,11 +1,14 @@
 package gameConfig
 
 import (
+	"bytes"
 	"dst-admin-go/internal/pkg/utils/collectionUtils"
 	"dst-admin-go/internal/pkg/utils/dstUtils"
 	"dst-admin-go/internal/pkg/utils/fileUtils"
 	"dst-admin-go/internal/service/archive"
 	"dst-admin-go/internal/service/levelConfig"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -211,9 +214,39 @@ func (p *GameConfig) GetClusterIni(clusterName string) (ClusterIni, error) {
 }
 
 func (p *GameConfig) SaveClusterIni(clusterName string, clusterIni *ClusterIni) error {
+	if clusterIni == nil {
+		return fmt.Errorf("缺少房间配置")
+	}
 	clusterIniPath := p.archive.ClusterIniPath(clusterName)
-	err := fileUtils.WriterTXT(clusterIniPath, dstUtils.ParseTemplate(ClusterIniTemplate, clusterIni))
-	return err
+	original, err := os.ReadFile(clusterIniPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := ini.Load(original)
+	if err != nil {
+		return fmt.Errorf("现有房间配置解析失败")
+	}
+	updates, err := ini.Load([]byte(dstUtils.ParseTemplate(ClusterIniTemplate, clusterIni)))
+	if err != nil {
+		return fmt.Errorf("房间配置格式无效")
+	}
+	for _, section := range updates.Sections() {
+		for _, key := range section.Keys() {
+			cfg.Section(section.Name()).Key(key.Name()).SetValue(key.Value())
+		}
+	}
+	var output bytes.Buffer
+	if _, err := cfg.WriteTo(&output); err != nil {
+		return err
+	}
+	info, err := os.Stat(clusterIniPath)
+	if err != nil {
+		return err
+	}
+	if err := writeTemporaryReplacement(clusterIniPath+".bak", original, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("备份房间配置失败: %w", err)
+	}
+	return writeTemporaryReplacement(clusterIniPath, output.Bytes(), info.Mode().Perm())
 }
 
 func (p *GameConfig) GetClusterToken(clusterName string) (string, error) {
