@@ -26,7 +26,6 @@ const (
 	dstVersionCacheTTL     = 5 * time.Minute
 	steamCmdVersionTimeout = 25 * time.Second
 	steamAPIVersionTimeout = 8 * time.Second
-	dstVersionURLTimeout   = 5 * time.Second
 )
 
 type dstVersionCacheEntry struct {
@@ -56,9 +55,9 @@ func (r *PathResolver) getLastDstVersion(clusterName string) (int64, error) {
 
 	var errs []string
 	if apiKey := strings.TrimSpace(config.Cfg.SteamAPIKey); apiKey != "" {
-		localVersion, localErr := r.GetLocalDstVersion(clusterName)
-		if localErr == nil && localVersion > 0 {
-			version, apiErr := r.latestDstVersionViaSteamAPI(apiKey, localVersion)
+		localBuildID, localErr := r.GetLocalDstBuildId(clusterName)
+		if localErr == nil && localBuildID > 0 {
+			version, apiErr := r.latestDstVersionViaSteamAPI(apiKey, localBuildID)
 			if apiErr == nil && version > 0 {
 				r.cacheLatestDstVersion(beta, version)
 				log.Printf("游戏版本查询：Steam Web API 返回 buildid %d", version)
@@ -68,7 +67,7 @@ func (r *PathResolver) getLastDstVersion(clusterName string) (int64, error) {
 				errs = append(errs, "Steam API: "+apiErr.Error())
 			}
 		} else if localErr != nil {
-			errs = append(errs, "读取本地版本失败: "+localErr.Error())
+			errs = append(errs, "读取本地 buildid 失败: "+localErr.Error())
 		}
 	}
 
@@ -80,15 +79,41 @@ func (r *PathResolver) getLastDstVersion(clusterName string) (int64, error) {
 		errs = append(errs, "SteamCMD: "+cmdErr.Error())
 	}
 
-	if version, urlErr := r.latestDstVersionViaURL(); urlErr == nil && version > 0 {
-		r.cacheLatestDstVersion(beta, version)
-		log.Printf("游戏版本查询：dstVersionUrl 返回 buildid %d", version)
-		return version, nil
-	} else if urlErr != nil {
-		errs = append(errs, "dstVersionUrl: "+urlErr.Error())
-	}
+	return -1, fmt.Errorf("无法获取最新游戏 buildid: %s", strings.Join(errs, "; "))
+}
 
-	return -1, fmt.Errorf("无法获取最新游戏版本: %s", strings.Join(errs, "; "))
+// GetLocalDstBuildId 读取本机已安装的 DST 专用服务器 buildid。
+// 来源是 Steam 的 appmanifest_343050.acf（与更新使用的 SteamCMD 数据一致）。
+func (r *PathResolver) GetLocalDstBuildId(clusterName string) (int64, error) {
+	dstCfg, err := r.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return 0, err
+	}
+	dstInstallDir := dstCfg.Force_install_dir
+	if dstCfg.Beta == 1 {
+		dstInstallDir = dstInstallDir + "-beta"
+	}
+	manifestPath := filepath.Join(dstInstallDir, "steamapps", "appmanifest_343050.acf")
+	content, err := fileUtils.ReadFile(manifestPath)
+	if err != nil {
+		return 0, fmt.Errorf("读取 %s 失败: %w", manifestPath, err)
+	}
+	return parseAppManifestBuildId(content)
+}
+
+// parseAppManifestBuildId 从 appmanifest_343050.acf 中解析 buildid。
+func parseAppManifestBuildId(content string) (int64, error) {
+	for _, raw := range strings.Split(content, "\n") {
+		key, value, ok := steamCmdKeyValue(strings.TrimSpace(raw))
+		if ok && key == "buildid" {
+			buildID, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || buildID <= 0 {
+				return 0, fmt.Errorf("buildid 无效: %q", value)
+			}
+			return buildID, nil
+		}
+	}
+	return 0, fmt.Errorf("appmanifest 中未找到 buildid")
 }
 
 func (r *PathResolver) cachedLatestDstVersion(beta bool) (int64, bool) {
@@ -189,33 +214,6 @@ func (r *PathResolver) latestDstVersionViaSteamCmd(dstCfg dstConfig.DstConfig) (
 		return 0, fmt.Errorf("执行失败: %v，输出尾部: %s", err, tailVersionOutput(string(output), 300))
 	}
 	return parseSteamCmdBuildId(string(output), dstCfg.Beta == 1)
-}
-
-// latestDstVersionViaURL 使用配置的 dstVersionUrl 查询版本（旧版兜底逻辑）。
-func (r *PathResolver) latestDstVersionViaURL() (int64, error) {
-	endpoint := strings.TrimSpace(config.Cfg.DstVersionUrl)
-	if endpoint == "" {
-		return 0, fmt.Errorf("未配置 dstVersionUrl")
-	}
-	client := &http.Client{Timeout: dstVersionURLTimeout}
-	resp, err := client.Get(endpoint)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-	text := strings.TrimSpace(string(body))
-	version, err := strconv.ParseInt(text, 10, 64)
-	if err != nil || version <= 0 {
-		return 0, fmt.Errorf("返回内容不是有效版本号: %q", tailVersionOutput(text, 80))
-	}
-	return version, nil
 }
 
 // parseSteamCmdBuildId 从 `steamcmd +app_info_print 343050` 输出中解析指定分支的 buildid。
