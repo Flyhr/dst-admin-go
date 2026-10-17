@@ -1010,6 +1010,9 @@ func (s *ModService) downloadModWithSteamCMD(config dstConfig.DstConfig, modDown
 	if err := os.MkdirAll(modDownloadPath, os.ModePerm); err != nil {
 		return fmt.Errorf("创建模组下载目录失败: %w", err)
 	}
+	// 上一次下载中断会在 SteamCMD 自己的 ACF/下载目录里留下未完成状态，
+	// 之后所有重试都会报 "Download item ... failed (Failure)"；下载前先清理该条目残留。
+	cleanSteamCmdStaleState(modDownloadPath, modId)
 
 	if runtime.GOOS == "windows" {
 		steamcmdPath := strings.TrimSpace(config.Steamcmd)
@@ -1047,6 +1050,31 @@ func (s *ModService) downloadModWithSteamCMD(config dstConfig.DstConfig, modDown
 		return fmt.Errorf("SteamCMD 下载模组 %s 失败: %v，输出: %s", modId, err, tailText(string(output), steamCmdOutputTailLimit))
 	}
 	return nil
+}
+
+// cleanSteamCmdStaleState 清理 SteamCMD 上一次中断留下的下载状态与 ACF 记录。
+// 残留的 BytesDownloaded/BytesToDownload 状态会让之后的下载一直报
+// "Download item ... failed (Failure)"，下载前清除该条目的残留即可恢复。
+func cleanSteamCmdStaleState(modDownloadPath, modId string) {
+	workshopRoot := filepath.Join(modDownloadPath, "steamapps", "workshop")
+	if err := fileUtils.DeleteDir(filepath.Join(workshopRoot, "downloads", "322330", modId)); err != nil {
+		log.Println("清理 SteamCMD 下载中间目录失败:", err)
+	}
+	if err := fileUtils.DeleteDir(filepath.Join(workshopRoot, "temp", "322330", modId)); err != nil {
+		log.Println("清理 SteamCMD 临时目录失败:", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(workshopRoot, "downloads", "state_322330_322330_"+modId+".patch*"))
+	if err != nil {
+		log.Println("查找 SteamCMD 下载状态文件失败:", err)
+	}
+	for _, path := range matches {
+		if removeErr := os.Remove(path); removeErr != nil {
+			log.Println("清理 SteamCMD 下载状态文件失败:", removeErr)
+		}
+	}
+	if _, err := removeACFWorkshopItem(filepath.Join(workshopRoot, "appworkshop_322330.acf"), modId); err != nil {
+		log.Println("清理 SteamCMD ACF 记录失败:", err)
+	}
 }
 
 // tailText 返回文本末尾最多 limit 个字符，用于错误信息中保留关键输出。
