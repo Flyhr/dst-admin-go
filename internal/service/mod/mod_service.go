@@ -395,6 +395,12 @@ func (s *ModService) SubscribeModByModId(clusterName, modId, lang string) (*mode
 	if fileUrl != nil {
 		fileUrlStr = fileUrl.(string)
 	}
+	// Steam 对 2020 年前上传的旧版工坊条目会返回 file_url（v1 内容包）。
+	// 这类内容只能解压到旧共享目录，当前专用服务器的 UGC 机制不会加载它；
+	// 以前会“订阅成功”但游戏永远装不上，这里直接返回明确错误，避免误判。
+	if fileUrlStr != "" {
+		return nil, fmt.Errorf("模组 %s 是旧版工坊内容（legacy/v1），当前专用服务器无法安装；请改用新版替代模组", modId)
+	}
 
 	// 检查数据库中是否已存在
 	existingMod, err := s.GetModByModId(modId)
