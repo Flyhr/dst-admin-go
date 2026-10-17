@@ -920,6 +920,56 @@ func (s *ModService) cleanupUgcForMod(clusterName, modId string) error {
 	return fileUtils.DeleteDir(filepath.Join(config.Force_install_dir, "ugc_mods", "content", "322330", modId))
 }
 
+// RepairStaleUgcRecords 清理游戏 ACF 中“记录为已安装、但对应文件目录已不存在”的失效条目。
+//
+// 这类残留会让 Steam 客户端的 Workshop 更新流程读取缺失文件失败（errno=2），
+// 进而把新模组的下载一起取消（日志表现为 ODPF failed entirely）。世界启动前调用。
+func (s *ModService) RepairStaleUgcRecords(clusterName string) error {
+	config, err := s.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return err
+	}
+	if clusterName == "" {
+		clusterName = config.Cluster
+	}
+	if config.Ugc_directory != "" {
+		acfPath := filepath.Join(config.Ugc_directory, "appworkshop_322330.acf")
+		items := parseWorkshopItemsInstalled(acfPath)
+		for id := range items {
+			if !fileUtils.Exists(s.pathResolver.GetUgcWorkshopModPath(clusterName, "", id)) {
+				if _, err := removeACFWorkshopItem(acfPath, id); err != nil {
+					return fmt.Errorf("清理 %s 的失效 UGC 记录失败: %w", acfPath, err)
+				}
+				fileUtils.DeleteDir(filepath.Join(config.Ugc_directory, "content", "322330", id))
+			}
+		}
+		return nil
+	}
+	if config.Force_install_dir == "" {
+		return nil
+	}
+	clusterRoot := filepath.Join(config.Force_install_dir, "ugc_mods", clusterName)
+	acfs, err := filepath.Glob(filepath.Join(clusterRoot, "*", "appworkshop_322330.acf"))
+	if err != nil {
+		return err
+	}
+	for _, acfPath := range acfs {
+		levelName := filepath.Base(filepath.Dir(acfPath))
+		items := parseWorkshopItemsInstalled(acfPath)
+		for id := range items {
+			if fileUtils.Exists(s.pathResolver.GetUgcWorkshopModPath(clusterName, levelName, id)) {
+				continue
+			}
+			if _, err := removeACFWorkshopItem(acfPath, id); err != nil {
+				return fmt.Errorf("清理 %s 的失效 UGC 记录失败: %w", acfPath, err)
+			}
+			s.deleteUgcDownloadState(clusterName, levelName, id)
+			log.Printf("清理失效 UGC 记录: %s %s", levelName, id)
+		}
+	}
+	return nil
+}
+
 // ===== 私有方法 =====
 
 // parseACFFile 解析 ACF 文件中的已安装工坊条目（只读 WorkshopItemsInstalled 段）。

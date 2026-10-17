@@ -95,6 +95,17 @@ func (p *GameHandler) Start(ctx *gin.Context) {
 		ctx.JSON(400, response.Response{Code: 400, Msg: "levelName query parameter is required"})
 		return
 	}
+	// 启动前先停世界并清理失效 UGC 记录：游戏运行期间 ACF 由 Steam 客户端管理，
+	// 残留的“已安装但文件缺失”记录会让本次 Workshop 更新整体失败。
+	if p.modService != nil {
+		if stopErr := p.process.Stop(clusterName, levelName); stopErr != nil {
+			ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: "failed to stop game server before start: " + stopErr.Error()})
+			return
+		}
+		if repairErr := p.modService.RepairStaleUgcRecords(clusterName); repairErr != nil {
+			log.Println("清理失效 UGC 记录失败:", repairErr)
+		}
+	}
 	err := p.process.Start(clusterName, levelName)
 	if err != nil {
 		ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: "failed to start game server: " + err.Error()})
@@ -118,6 +129,16 @@ func (p *GameHandler) Start(ctx *gin.Context) {
 // @Router /api/game/start/all [get]
 func (p *GameHandler) StartAll(ctx *gin.Context) {
 	clusterName := context.GetClusterName(ctx)
+	// 启动前先停世界并清理失效 UGC 记录，避免残留 ACF 记录导致 Workshop 更新整体失败。
+	if p.modService != nil {
+		if stopErr := p.process.StopAll(clusterName); stopErr != nil {
+			ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: "failed to stop game servers before start: " + stopErr.Error()})
+			return
+		}
+		if repairErr := p.modService.RepairStaleUgcRecords(clusterName); repairErr != nil {
+			log.Println("清理失效 UGC 记录失败:", repairErr)
+		}
+	}
 	err := p.process.StartAll(clusterName)
 	if err != nil {
 		ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: "failed to start all game servers: " + err.Error()})
