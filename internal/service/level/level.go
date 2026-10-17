@@ -8,7 +8,9 @@ import (
 	"dst-admin-go/internal/service/game"
 	"dst-admin-go/internal/service/gameConfig"
 	"dst-admin-go/internal/service/levelConfig"
+	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -52,7 +54,7 @@ func (l *LevelService) GetLevelList(clusterName string) []levelConfig.LevelInfo 
 				Modoverrides:      "return {}",
 				ServerIni:         levelConfig.NewMasterServerIni(),
 			}
-			l.initLevel(filepath.Join(l.resolver.ClusterPath(clusterName), "Master"), &master)
+			l.initLevel(filepath.Join(l.resolver.ClusterPath(clusterName), "Master"), &master, true)
 			levels = append([]levelConfig.LevelInfo{}, master)
 			config.LevelList = append(config.LevelList, levelConfig.Item{
 				Name: "Forest",
@@ -62,7 +64,7 @@ func (l *LevelService) GetLevelList(clusterName string) []levelConfig.LevelInfo 
 			if err != nil {
 				log.Println(err)
 			}
-			return levels
+			return l.attachModConfigScope(clusterName, levels)
 		} else {
 			// 读取现有的 Master 世界配置
 			master := l.GetLevel(clusterName, "Master")
@@ -84,7 +86,7 @@ func (l *LevelService) GetLevelList(clusterName string) []levelConfig.LevelInfo 
 			if err != nil {
 				log.Println(err)
 			}
-			return levels
+			return l.attachModConfigScope(clusterName, levels)
 		}
 	}
 	for i := range config.LevelList {
@@ -98,7 +100,7 @@ func (l *LevelService) GetLevelList(clusterName string) []levelConfig.LevelInfo 
 		level1.ServerIni = world.ServerIni
 		levels = append(levels, level1)
 	}
-	return levels
+	return l.attachModConfigScope(clusterName, levels)
 }
 
 // GetLevel 获取单个关卡配置
@@ -119,11 +121,16 @@ func (l *LevelService) GetLevel(clusterName string, levelName string) levelConfi
 		leveldataoverride = "return {}"
 	}
 
-	// 读取 modoverrides.lua
+	// 读取 modoverrides.lua。缺失文件沿用空配置；断链或无权限不能伪装成空配置。
 	mPath := filepath.Join(levelFolderPath, "modoverrides.lua")
 	modoverrides, err := fileUtils.ReadFile(mPath)
+	modConfigError := ""
 	if err != nil {
-		modoverrides = "return {}"
+		if _, _, resolveErr := resolveModTarget(filepath.Dir(levelFolderPath), levelName); resolveErr != nil {
+			modConfigError = resolveErr.Error()
+		} else {
+			modoverrides = "return {}"
+		}
 	}
 
 	// 读取 server.ini
@@ -136,6 +143,7 @@ func (l *LevelService) GetLevel(clusterName string, levelName string) levelConfi
 		Uuid:              levelName,
 		Leveldataoverride: leveldataoverride,
 		Modoverrides:      modoverrides,
+		ModConfigError:    modConfigError,
 		ServerIni:         serverIni,
 	}
 }
@@ -184,39 +192,85 @@ func (l *LevelService) GetServerIni(filepath string, isMaster bool) levelConfig.
 
 // UpdateLevels 更新多个关卡配置
 func (l *LevelService) UpdateLevels(clusterName string, levels []levelConfig.LevelInfo) error {
-	for i := range levels {
-		config, _ := l.dstConfig.GetDstConfig(clusterName)
-		dstUtils.DedicatedServerModsSetup(config, levels[i].Modoverrides)
-		err := l.UpdateLevel(clusterName, &levels[i])
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return l.saveLevels(clusterName, levels)
 }
 
 // UpdateLevel 更新单个关卡配置
 func (l *LevelService) UpdateLevel(clusterName string, level *levelConfig.LevelInfo) error {
-	levelFolderPath := filepath.Join(l.resolver.ClusterPath(clusterName), level.Uuid)
-	fileUtils.CreateDirIfNotExists(levelFolderPath)
-	l.initLevel(levelFolderPath, level)
+	if level == nil {
+		return fmt.Errorf("世界配置为空")
+	}
+	return l.saveLevels(clusterName, []levelConfig.LevelInfo{*level})
+}
 
-	// 记录level.json 文件
-	levelConfig, err := l.levelConfigUtils.GetLevelConfig(clusterName)
+func (l *LevelService) saveLevels(clusterName string, levels []levelConfig.LevelInfo) error {
+	writes, err := l.planModWrites(clusterName, levels)
 	if err != nil {
 		return err
 	}
-	for i := range levelConfig.LevelList {
-		if level.Uuid == levelConfig.LevelList[i].File {
-			levelConfig.LevelList[i].Name = level.LevelName
-			// 更新世界配置
-			l.initLevel(levelFolderPath, level)
+	config, err := l.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return err
+	}
+	for _, write := range writes {
+		if err = fileUtils.WriterTXT(write.writePath, write.content); err != nil {
+			return err
+		}
+	}
+	seen := map[string]struct{}{}
+	for _, write := range writes {
+		if _, ok := seen[write.content]; ok {
+			continue
+		}
+		seen[write.content] = struct{}{}
+		if err = dstUtils.DedicatedServerModsSetup(config, write.content); err != nil {
+			return fmt.Errorf("模组配置已写入，但安装列表更新失败，请刷新后核对")
+		}
+	}
+	for i := range levels {
+		if err = l.updateWorldFiles(clusterName, &levels[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *LevelService) worldFilesUnchanged(levelFolderPath string, level *levelConfig.LevelInfo) bool {
+	overridePath := archive.WorldOverridePath(levelFolderPath)
+	currentOverride, err := os.ReadFile(overridePath)
+	if err != nil || string(currentOverride) != level.Leveldataoverride {
+		return false
+	}
+	iniPath := filepath.Join(levelFolderPath, "server.ini")
+	if _, err = os.Stat(iniPath); err != nil {
+		return false
+	}
+	currentIni := l.GetServerIni(iniPath, level.ServerIni.IsMaster)
+	return currentIni == level.ServerIni
+}
+
+func (l *LevelService) updateWorldFiles(clusterName string, level *levelConfig.LevelInfo) error {
+	clusterPath := l.resolver.ClusterPath(clusterName)
+	levelFolderPath := filepath.Join(clusterPath, level.Uuid)
+	if err := insideCluster(clusterPath, levelFolderPath); err != nil {
+		return err
+	}
+	fileUtils.CreateDirIfNotExists(levelFolderPath)
+	if !l.worldFilesUnchanged(levelFolderPath, level) {
+		l.initLevel(levelFolderPath, level, false)
+	}
+
+	saved, err := l.levelConfigUtils.GetLevelConfig(clusterName)
+	if err != nil {
+		return err
+	}
+	for i := range saved.LevelList {
+		if level.Uuid == saved.LevelList[i].File {
+			saved.LevelList[i].Name = level.LevelName
 			break
 		}
 	}
-	err = l.levelConfigUtils.SaveLevelConfig(clusterName, levelConfig)
-	return err
+	return l.levelConfigUtils.SaveLevelConfig(clusterName, saved)
 }
 
 // CreateLevel 创建新关卡
@@ -229,7 +283,7 @@ func (l *LevelService) CreateLevel(clusterName string, level *levelConfig.LevelI
 	}
 	levelFolderPath := filepath.Join(l.resolver.ClusterPath(clusterName), uuid)
 	fileUtils.CreateDirIfNotExists(levelFolderPath)
-	l.initLevel(levelFolderPath, level)
+	l.initLevel(levelFolderPath, level, true)
 
 	// 记录level.json 文件
 	config, err := l.levelConfigUtils.GetLevelConfig(clusterName)
@@ -276,18 +330,19 @@ func (l *LevelService) DeleteLevel(clusterName string, levelName string) error {
 }
 
 // initLevel 初始化关卡文件
-func (l *LevelService) initLevel(levelFolderPath string, level *levelConfig.LevelInfo) {
+func (l *LevelService) initLevel(levelFolderPath string, level *levelConfig.LevelInfo, writeMod bool) {
 
 	lPath := archive.WorldOverridePath(levelFolderPath)
 	mPath := filepath.Join(levelFolderPath, "modoverrides.lua")
 	sPath := filepath.Join(levelFolderPath, "server.ini")
 
 	fileUtils.CreateFileIfNotExists(lPath)
-	fileUtils.CreateFileIfNotExists(mPath)
 	fileUtils.CreateFileIfNotExists(sPath)
-
 	fileUtils.WriterTXT(lPath, level.Leveldataoverride)
-	fileUtils.WriterTXT(mPath, level.Modoverrides)
+	if writeMod {
+		fileUtils.CreateFileIfNotExists(mPath)
+		fileUtils.WriterTXT(mPath, level.Modoverrides)
+	}
 	serverBuf := l.ParseTemplate(level.ServerIni)
 	fileUtils.WriterTXT(sPath, serverBuf)
 }

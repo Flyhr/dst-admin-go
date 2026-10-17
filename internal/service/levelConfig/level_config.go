@@ -30,6 +30,8 @@ type LevelInfo struct {
 	Leveldataoverride string    `json:"leveldataoverride"`
 	Modoverrides      string    `json:"modoverrides"`
 	ServerIni         ServerIni `json:"server_ini"`
+	ModConfigWorlds   []string  `json:"modConfigWorlds"`
+	ModConfigError    string    `json:"modConfigError,omitempty"`
 }
 
 type ServerIni struct {

@@ -75,7 +75,7 @@ func (h *LevelHandler) UpdateLevel(ctx *gin.Context) {
 	if err != nil {
 		ctx.JSON(http.StatusOK, response.Response{
 			Code: 500,
-			Msg:  "update level failed",
+			Msg:  err.Error(),
 			Data: nil,
 		})
 		return
@@ -184,7 +184,7 @@ func (h *LevelHandler) UpdateLevels(ctx *gin.Context) {
 	if err != nil {
 		ctx.JSON(http.StatusOK, response.Response{
 			Code: 500,
-			Msg:  "update levels failed",
+			Msg:  err.Error(),
 			Data: nil,
 		})
 		return
