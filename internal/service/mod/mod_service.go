@@ -3,6 +3,7 @@ package mod
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"dst-admin-go/internal/model"
 	"dst-admin-go/internal/pkg/utils/fileUtils"
@@ -37,6 +38,11 @@ const (
 	steamAPIKey = "73DF9F781D195DFD3D19DED1CB72EEE6"
 	appID       = 322330
 	language    = 6
+
+	// modDownloadTimeout 限制单个模组的 SteamCMD 下载时间，避免请求无限阻塞。
+	modDownloadTimeout = 10 * time.Minute
+	// steamCmdOutputTailLimit 错误信息中保留的 SteamCMD 输出尾部字符数。
+	steamCmdOutputTailLimit = 500
 )
 
 func steamAuthorProfileURL(steamID string) string {
@@ -130,6 +136,8 @@ type ModService struct {
 	db           *gorm.DB
 	dstConfig    dstConfig.Config
 	pathResolver *archive.PathResolver
+	// modDownloadLocks 按 modId 串行化模组下载，避免并发安装同一模组时重复下载。
+	modDownloadLocks sync.Map
 }
 
 func NewModService(db *gorm.DB, config dstConfig.Config, pathResolver *archive.PathResolver) *ModService {
@@ -383,24 +391,35 @@ func (s *ModService) SubscribeModByModId(clusterName, modId, lang string) (*mode
 	creatorAppid := data2["creator_appid"].(float64)
 	consumerAppid := data2["consumer_appid"].(float64)
 
+	var fileUrlStr = ""
+	if fileUrl != nil {
+		fileUrlStr = fileUrl.(string)
+	}
+
 	// 检查数据库中是否已存在
 	existingMod, err := s.GetModByModId(modId)
 	if err == nil && existingMod.Modid != "" {
 		if lastTime == existingMod.LastTime {
+			// 数据库记录没有变化，但必须确认本地仍然存在可用的 modinfo.lua 配置：
+			// 缓存可能被清理，或旧版本曾把下载失败保存成空配置，不能继续当作成功返回。
+			_, hasLocalModInfo := s.localModInfoPath(clusterName, modId)
+			if hasLocalModInfo && !modConfigMissing(existingMod.ModConfig) {
+				return existingMod, nil
+			}
+			modConfig, err := s.buildModConfig(clusterName, lang, modId, fileUrlStr)
+			if err != nil {
+				return nil, fmt.Errorf("读取或重新下载模组配置失败: %w", err)
+			}
+			existingMod.ModConfig = modConfig
+			if err := s.db.Save(existingMod).Error; err != nil {
+				return nil, fmt.Errorf("保存模组信息失败: %w", err)
+			}
 			return existingMod, nil
 		}
 		// 需要更新
-		var modConfig string
-		var fileUrlStr = ""
-		if fileUrl != nil {
-			fileUrlStr = fileUrl.(string)
-		}
-		if fileUrlStr != "" {
-			modConfigJson, _ := json.Marshal(s.getV1ModInfoConfig(clusterName, lang, modId, fileUrlStr))
-			modConfig = string(modConfigJson)
-		} else {
-			modConfigJson, _ := json.Marshal(s.getModInfoConfig(clusterName, lang, modId))
-			modConfig = string(modConfigJson)
+		modConfig, err := s.buildModConfig(clusterName, lang, modId, fileUrlStr)
+		if err != nil {
+			return nil, err
 		}
 
 		existingMod.LastTime = lastTime
@@ -411,23 +430,16 @@ func (s *ModService) SubscribeModByModId(clusterName, modId, lang string) (*mode
 		existingMod.V = v
 		existingMod.ModConfig = modConfig
 		existingMod.Update = false
-		s.db.Save(existingMod)
+		if err := s.db.Save(existingMod).Error; err != nil {
+			return nil, fmt.Errorf("保存模组信息失败: %w", err)
+		}
 		return existingMod, nil
 	}
 
 	// 新增mod
-	var fileUrlStr = ""
-	if fileUrl != nil {
-		fileUrlStr = fileUrl.(string)
-	}
-
-	var modConfig string
-	if fileUrlStr != "" {
-		modConfigJson, _ := json.Marshal(s.getV1ModInfoConfig(clusterName, lang, modId, fileUrlStr))
-		modConfig = string(modConfigJson)
-	} else {
-		modConfigJson, _ := json.Marshal(s.getModInfoConfig(clusterName, lang, modId))
-		modConfig = string(modConfigJson)
+	modConfig, err := s.buildModConfig(clusterName, lang, modId, fileUrlStr)
+	if err != nil {
+		return nil, err
 	}
 
 	newModInfo := &model.ModInfo{
@@ -444,8 +456,35 @@ func (s *ModService) SubscribeModByModId(clusterName, modId, lang string) (*mode
 		ModConfig:     modConfig,
 	}
 
-	err = s.db.Create(newModInfo).Error
-	return newModInfo, err
+	if err := s.db.Create(newModInfo).Error; err != nil {
+		return nil, fmt.Errorf("保存模组信息失败: %w", err)
+	}
+	return newModInfo, nil
+}
+
+// buildModConfig 读取本地或下载模组并序列化 mod_config，失败时返回具体原因。
+func (s *ModService) buildModConfig(clusterName, lang, modId, fileUrlStr string) (string, error) {
+	var metadata map[string]interface{}
+	var err error
+	if fileUrlStr != "" {
+		metadata, err = s.getV1ModInfoConfig(clusterName, lang, modId, fileUrlStr)
+	} else {
+		metadata, err = s.getModInfoConfig(clusterName, lang, modId)
+	}
+	if err != nil {
+		return "", err
+	}
+	modConfigJson, err := json.Marshal(metadata)
+	if err != nil {
+		return "", fmt.Errorf("解析模组配置失败: %w", err)
+	}
+	return string(modConfigJson), nil
+}
+
+// modConfigMissing 判断数据库中的 mod_config 是否为空；旧版本下载失败时会保存成空对象。
+func modConfigMissing(modConfig string) bool {
+	trimmed := strings.TrimSpace(modConfig)
+	return trimmed == "" || trimmed == "{}" || trimmed == "null"
 }
 
 // GetMyModList 合并面板订阅记录和服务器已经安装的模组，不写入数据库或游戏文件。
@@ -831,78 +870,145 @@ func (s *ModService) parseACFFile(filePath string) map[string]WorkshopItem {
 	return workshopItems
 }
 
-// getModInfoConfig 获取mod配置信息
-func (s *ModService) getModInfoConfig(clusterName, lang, modId string) map[string]interface{} {
-	// 从服务器本地读取mod信息
-	if dstModInstalledPath, ok := s.getDstUcgsModsInstalledPath(clusterName, modId); ok {
-		modinfoPath := filepath.Join(dstModInstalledPath, "modinfo.lua")
-		if _, err := os.Stat(modinfoPath); err == nil {
-			return s.readModInfo(lang, modId, modinfoPath)
-		}
+// getModInfoConfig 获取mod配置信息；本地与缓存都没有 modinfo.lua 时下载，失败返回错误。
+func (s *ModService) getModInfoConfig(clusterName, lang, modId string) (map[string]interface{}, error) {
+	// 1. 游戏安装目录或面板下载缓存里已有 modinfo.lua，直接读取，不再重复下载。
+	if modinfoPath, ok := s.localModInfoPath(clusterName, modId); ok {
+		return s.readModInfoStrict(lang, modId, modinfoPath)
 	}
 
-	// 检查mod文件是否已经存在
-	config, _ := s.dstConfig.GetDstConfig(clusterName)
-	modDownloadPath := config.Mod_download_path
-	fileUtils.CreateDirIfNotExists(modDownloadPath)
+	// 2. 同一 modId 的下载串行化，避免并发请求重复下载。
+	unlock := s.lockModDownload(modId)
+	defer unlock()
+	// 获取锁后再次检查：等待期间其它请求可能已经下载完成。
+	if modinfoPath, ok := s.localModInfoPath(clusterName, modId); ok {
+		return s.readModInfoStrict(lang, modId, modinfoPath)
+	}
 
-	// 下载的模组位置
+	config, err := s.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return nil, fmt.Errorf("获取DST配置失败: %w", err)
+	}
+	modDownloadPath := strings.TrimSpace(config.Mod_download_path)
+	if modDownloadPath == "" {
+		return nil, errors.New("未配置模组下载目录 mod_download_path")
+	}
+	if !isWorkshopId(modId) {
+		return nil, fmt.Errorf("未找到本地模组 modinfo.lua: %s", modId)
+	}
+	if strings.TrimSpace(config.Steamcmd) == "" {
+		return nil, errors.New("未配置 SteamCMD 路径，无法下载模组")
+	}
+
 	modPath := filepath.Join(modDownloadPath, "steamapps", "workshop", "content", "322330", modId)
-	if _, err := os.Stat(modPath); err == nil {
-		log.Println("Mod already downloaded to:", modPath)
-	} else {
-		// 调用 SteamCMD 命令下载 mod
-		steamcmd := config.Steamcmd
-		if runtime.GOOS == "windows" {
-			cmd := "cd /d " + steamcmd + " && Start steamcmd.exe +login anonymous +force_install_dir " + modDownloadPath + " +workshop_download_item 322330 " + modId + " +quit"
-			log.Println("正在下载模组 command:", cmd)
-			_, err := shellUtils.ExecuteCommandInWin(cmd)
-			if err != nil {
-				log.Println("下载mod失败，请检查steamcmd路径是否配置正确", err)
-				return make(map[string]interface{})
-			}
-		} else {
-			var cmd *exec.Cmd
-			if fileUtils.Exists(filepath.Join(steamcmd, "steamcmd")) {
-				cmd = exec.Command(filepath.Join(steamcmd, "steamcmd"), "+login anonymous", "+force_install_dir", modDownloadPath, "+workshop_download_item 322330 "+modId, "+quit")
-			} else {
-				cmd = exec.Command(filepath.Join(steamcmd, "steamcmd.sh"), "+login anonymous", "+force_install_dir", modDownloadPath, "+workshop_download_item 322330 "+modId, "+quit")
-			}
-
-			log.Println("正在下载模组 command:", cmd)
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				log.Println("下载mod失败，请检查steamcmd路径是否配置正确", err)
-				return make(map[string]interface{})
-			}
-
-			// 解析 SteamCMD 输出
-			re := regexp.MustCompile(`Downloaded item \d+ to "([^"]+)"`)
-			match := re.FindStringSubmatch(string(output))
-			if len(match) < 2 {
-				log.Println("Error parsing output:", string(output))
-				return make(map[string]interface{})
-			}
-			log.Println("Mod downloaded to:", match[1])
-		}
+	if err := s.downloadModWithSteamCMD(config, modDownloadPath, modId); err != nil {
+		return nil, err
 	}
 
-	// 查找 modinfo.lua 文件
+	// 3. 下载后必须校验 modinfo.lua 确实存在，不能仅凭命令输出判断成功。
 	modinfoPath := filepath.Join(modPath, "modinfo.lua")
-	if _, err := os.Stat(modinfoPath); err != nil {
-		log.Println("Error finding modinfo.lua:", err)
-		return make(map[string]interface{})
+	if !fileUtils.Exists(modinfoPath) {
+		return nil, fmt.Errorf("SteamCMD 未下载到 modinfo.lua: %s（请确认模组ID是否正确以及 SteamCMD 配置）", modinfoPath)
 	}
-	return s.readModInfo(lang, modId, modinfoPath)
+	return s.readModInfoStrict(lang, modId, modinfoPath)
 }
 
-// getV1ModInfoConfig 从v1 mod中获取配置
-func (s *ModService) getV1ModInfoConfig(clusterName, lang, modid, fileUrl string) map[string]interface{} {
+// localModInfoPath 返回本地可用的 modinfo.lua 路径：优先游戏已安装目录，其次面板下载缓存。
+func (s *ModService) localModInfoPath(clusterName, modId string) (string, bool) {
+	config, err := s.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return "", false
+	}
+	var paths []string
+	if dstModInstalledPath, ok := s.getDstUcgsModsInstalledPath(clusterName, modId); ok {
+		paths = append(paths, filepath.Join(dstModInstalledPath, "modinfo.lua"))
+	}
+	if config.Force_install_dir != "" {
+		paths = append(paths,
+			filepath.Join(config.Force_install_dir, "mods", "workshop-"+modId, "modinfo.lua"),
+			filepath.Join(config.Force_install_dir, "mods", modId, "modinfo.lua"),
+		)
+	}
+	if config.Mod_download_path != "" {
+		paths = append(paths, filepath.Join(config.Mod_download_path, "steamapps", "workshop", "content", "322330", modId, "modinfo.lua"))
+	}
+	for _, path := range paths {
+		if fileUtils.Exists(path) {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// lockModDownload 获取指定 modId 的下载锁，返回解锁函数。
+func (s *ModService) lockModDownload(modId string) func() {
+	value, _ := s.modDownloadLocks.LoadOrStore(modId, &sync.Mutex{})
+	mutex := value.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+// downloadModWithSteamCMD 调用 SteamCMD 下载模组，失败或超时时返回带输出尾部的错误。
+func (s *ModService) downloadModWithSteamCMD(config dstConfig.DstConfig, modDownloadPath, modId string) error {
+	if err := os.MkdirAll(modDownloadPath, os.ModePerm); err != nil {
+		return fmt.Errorf("创建模组下载目录失败: %w", err)
+	}
+
+	if runtime.GOOS == "windows" {
+		steamcmdPath := strings.TrimSpace(config.Steamcmd)
+		steamcmdExe := filepath.Join(steamcmdPath, "steamcmd.exe")
+		if !fileUtils.Exists(steamcmdExe) {
+			return fmt.Errorf("SteamCMD 路径无效，未找到 %s", steamcmdExe)
+		}
+		cmd := fmt.Sprintf("cd /d \"%s\" && steamcmd.exe +login anonymous +force_install_dir \"%s\" +workshop_download_item 322330 %s +quit", steamcmdPath, modDownloadPath, modId)
+		log.Println("正在下载模组 command:", cmd)
+		output, err := shellUtils.ExecuteCommandInWin(cmd)
+		if err != nil {
+			return fmt.Errorf("SteamCMD 下载模组 %s 失败: %v，输出: %s", modId, err, tailText(output, steamCmdOutputTailLimit))
+		}
+		return nil
+	}
+
+	steamcmdPath := strings.TrimSpace(config.Steamcmd)
+	steamcmdFile := filepath.Join(steamcmdPath, "steamcmd")
+	if !fileUtils.Exists(steamcmdFile) {
+		steamcmdFile = filepath.Join(steamcmdPath, "steamcmd.sh")
+	}
+	if !fileUtils.Exists(steamcmdFile) {
+		return fmt.Errorf("SteamCMD 路径无效，未找到 steamcmd 或 steamcmd.sh: %s", steamcmdPath)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), modDownloadTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, steamcmdFile, "+login", "anonymous", "+force_install_dir", modDownloadPath, "+workshop_download_item", "322330", modId, "+quit")
+	log.Println("正在下载模组 command:", cmd)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("SteamCMD 下载模组 %s 超时（限制 %s），输出: %s", modId, modDownloadTimeout, tailText(string(output), steamCmdOutputTailLimit))
+	}
+	if err != nil {
+		return fmt.Errorf("SteamCMD 下载模组 %s 失败: %v，输出: %s", modId, err, tailText(string(output), steamCmdOutputTailLimit))
+	}
+	return nil
+}
+
+// tailText 返回文本末尾最多 limit 个字符，用于错误信息中保留关键输出。
+func tailText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return "..." + text[len(text)-limit:]
+}
+
+// getV1ModInfoConfig 从v1 mod中获取配置，下载或解压失败时返回错误。
+func (s *ModService) getV1ModInfoConfig(clusterName, lang, modid, fileUrl string) (map[string]interface{}, error) {
 	log.Println("开始下载 v1 mod，并提取 modinfo.lua 文件")
 	modinfo := map[string][]byte{"modinfo": nil, "modinfo_chs": nil}
 	var tmp bytes.Buffer
 
 	for i := 0; i < 3; i++ {
+		tmp.Reset()
 		req, err := http.NewRequest("GET", fileUrl, nil)
 		if err != nil {
 			log.Println(fileUrl, "下载失败", err)
@@ -916,8 +1022,8 @@ func (s *ModService) getV1ModInfoConfig(clusterName, lang, modid, fileUrl string
 			log.Println(fileUrl, "下载失败", err)
 			continue
 		}
-		defer res.Body.Close()
 		_, err = tmp.ReadFrom(res.Body)
+		res.Body.Close()
 		if err != nil {
 			log.Println(err)
 			continue
@@ -926,44 +1032,49 @@ func (s *ModService) getV1ModInfoConfig(clusterName, lang, modid, fileUrl string
 	}
 
 	if tmp.Len() == 0 {
-		log.Println(fileUrl, "下载失败 3 次，不再尝试")
-		return make(map[string]interface{})
+		return nil, fmt.Errorf("模组压缩包下载失败（已重试 3 次）: %s", fileUrl)
 	}
 
 	log.Println(fileUrl, "下载成功，开始解压")
 	zipReader, err := zip.NewReader(bytes.NewReader(tmp.Bytes()), int64(tmp.Len()))
 	if err != nil {
-		log.Println("模组zip解压失败", err)
-		return make(map[string]interface{})
+		return nil, fmt.Errorf("模组压缩包解析失败: %w", err)
 	}
 
-	_ = s.unzipToDir(zipReader, filepath.Join(s.pathResolver.GetUgcModPath(clusterName), "content", "322330", modid))
+	if err := s.unzipToDir(zipReader, filepath.Join(s.pathResolver.GetUgcModPath(clusterName), "content", "322330", modid)); err != nil {
+		return nil, fmt.Errorf("解压模组文件失败: %w", err)
+	}
 
 	for _, file := range zipReader.File {
 		switch file.Name {
 		case "modinfo.lua":
-			f, _ := file.Open()
-			modinfoBytes, err := ioutil.ReadAll(f)
+			f, err := file.Open()
 			if err != nil {
-				log.Println(fileUrl, "解压 modinfo.lua 失败", err)
-				continue
+				return nil, fmt.Errorf("读取模组压缩包中的 modinfo.lua 失败: %w", err)
+			}
+			modinfoBytes, err := ioutil.ReadAll(f)
+			f.Close()
+			if err != nil {
+				return nil, fmt.Errorf("读取模组压缩包中的 modinfo.lua 失败: %w", err)
 			}
 			modinfo["modinfo"] = modinfoBytes
 		case "modinfo_chs.lua":
-			f, _ := file.Open()
-			modinfoBytes, err := ioutil.ReadAll(f)
+			f, err := file.Open()
 			if err != nil {
-				log.Println(fileUrl, "解压 modinfo_chs.lua 失败", err)
 				continue
 			}
-			modinfo["modinfo_chs"] = modinfoBytes
+			modinfoBytes, err := ioutil.ReadAll(f)
+			f.Close()
+			if err == nil {
+				modinfo["modinfo_chs"] = modinfoBytes
+			}
 		}
 	}
 
-	if modinfo["modinfo"] != nil {
-		return s.parseModInfoLua(lang, modid, string(modinfo["modinfo"]))
+	if len(modinfo["modinfo"]) == 0 {
+		return nil, fmt.Errorf("模组压缩包中缺少 modinfo.lua: %s", fileUrl)
 	}
-	return make(map[string]interface{})
+	return s.parseModInfoLua(lang, modid, string(modinfo["modinfo"])), nil
 }
 
 // getDstUcgsModsInstalledPath 获取饥荒本身modid的位置
@@ -990,12 +1101,21 @@ func (s *ModService) getDstUcgsModsInstalledPath(clusterName, modid string) (str
 
 // readModInfo 读取modinfo.lua文件
 func (s *ModService) readModInfo(lang, modId, modinfoPath string) map[string]interface{} {
-	script, err := ioutil.ReadFile(modinfoPath)
+	metadata, err := s.readModInfoStrict(lang, modId, modinfoPath)
 	if err != nil {
 		log.Println("Error reading modinfo.lua:", err)
 		return make(map[string]interface{})
 	}
-	return s.parseModInfoLua(lang, modId, string(script))
+	return metadata
+}
+
+// readModInfoStrict 读取modinfo.lua文件，失败时返回错误。
+func (s *ModService) readModInfoStrict(lang, modId, modinfoPath string) (map[string]interface{}, error) {
+	script, err := ioutil.ReadFile(modinfoPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 modinfo.lua 失败: %w", err)
+	}
+	return s.parseModInfoLua(lang, modId, string(script)), nil
 }
 
 // parseModInfoLua 解析modinfo.lua文件
@@ -1109,7 +1229,14 @@ func (s *ModService) searchModInfoByWorkshopId(modID int) ModInfo {
 
 // getLocalModInfo 获取本地mod信息
 func (s *ModService) getLocalModInfo(clusterName, lang, modId string) (*model.ModInfo, error) {
-	modConfigJson, _ := json.Marshal(s.getModInfoConfig(clusterName, lang, modId))
+	metadata, err := s.getModInfoConfig(clusterName, lang, modId)
+	if err != nil {
+		return nil, err
+	}
+	modConfigJson, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("解析模组配置失败: %w", err)
+	}
 	modConfig := string(modConfigJson)
 
 	newModInfo := &model.ModInfo{
@@ -1125,8 +1252,10 @@ func (s *ModService) getLocalModInfo(clusterName, lang, modId string) (*model.Mo
 		ModConfig:     modConfig,
 	}
 
-	err := s.db.Create(newModInfo).Error
-	return newModInfo, err
+	if err := s.db.Create(newModInfo).Error; err != nil {
+		return nil, fmt.Errorf("保存模组信息失败: %w", err)
+	}
+	return newModInfo, nil
 }
 
 // addModInfoToDb 添加mod信息到数据库
@@ -1145,11 +1274,18 @@ func (s *ModService) addModInfoToDb(clusterName, lang, modid string) error {
 		return fmt.Errorf("获取modinfo失败: %w", err)
 	}
 
+	metadata, err := s.getModInfoConfig(clusterName, lang, modid)
+	if err != nil {
+		return fmt.Errorf("获取modinfo配置失败: %w", err)
+	}
+	modConfigJson, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("解析模组配置失败: %w", err)
+	}
+	modConfig := string(modConfigJson)
+
 	// 从数据库查找是否已存在
 	oldModinfo, err := s.GetModByModId(modid)
-	var modConfig string
-	modConfigJson, _ := json.Marshal(s.getModInfoConfig(clusterName, lang, modid))
-	modConfig = string(modConfigJson)
 
 	if err == nil && oldModinfo.Modid != "" {
 		// 更新
@@ -1160,12 +1296,18 @@ func (s *ModService) addModInfoToDb(clusterName, lang, modid string) error {
 		oldModinfo.Img = modInfo.Img
 		oldModinfo.V = modInfo.V
 		oldModinfo.ModConfig = modConfig
-		return s.db.Save(oldModinfo).Error
+		if err := s.db.Save(oldModinfo).Error; err != nil {
+			return fmt.Errorf("保存模组信息失败: %w", err)
+		}
+		return nil
 	}
 
 	// 新增
 	modInfo.ModConfig = modConfig
-	return s.db.Create(modInfo).Error
+	if err := s.db.Create(modInfo).Error; err != nil {
+		return fmt.Errorf("保存模组信息失败: %w", err)
+	}
+	return nil
 }
 
 // getModInfo2 从Steam API获取mod基本信息
