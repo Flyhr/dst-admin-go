@@ -28,6 +28,7 @@ func (h *ModHandler) RegisterRoute(router *gin.RouterGroup) {
 	modGroup := router.Group("/api/mod")
 	{
 		modGroup.GET("/search", h.SearchModList)
+		modGroup.GET("/install/status", h.GetModInstallStatus)
 		modGroup.GET("/:modId", h.GetModInfo)
 		modGroup.PUT("/:modId", h.UpdateMod)
 		modGroup.GET("", h.GetMyModList)
@@ -151,6 +152,24 @@ func (h *ModHandler) GetMyModList(ctx *gin.Context) {
 	}
 
 	response.OkWithData(modDataList, ctx)
+}
+
+// GetModInstallStatus 获取模组安装状态
+// @Summary 获取模组安装状态
+// @Description 返回服务器启动后等待安装的模组进度（轻量接口，不调用 Steam API）
+// @Tags mod
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response{data=mod.ModInstallStatus}
+// @Router /api/mod/install/status [get]
+func (h *ModHandler) GetModInstallStatus(ctx *gin.Context) {
+	status, err := h.modService.GetModInstallStatus(context.GetClusterName(ctx))
+	if err != nil {
+		response.FailWithMessage("获取模组安装状态失败: "+err.Error(), ctx)
+		return
+	}
+
+	response.OkWithData(status, ctx)
 }
 
 // UpdateAllModInfos 批量更新模组信息

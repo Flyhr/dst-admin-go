@@ -11,6 +11,7 @@ import (
 	"dst-admin-go/internal/service/gameArchive"
 	"dst-admin-go/internal/service/level"
 	"dst-admin-go/internal/service/levelConfig"
+	"dst-admin-go/internal/service/mod"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -28,15 +29,17 @@ type GameHandler struct {
 	gameArchive      *gameArchive.GameArchive
 	levelConfigUtils *levelConfig.LevelConfigUtils
 	archive          *archive.PathResolver
+	modService       *mod.ModService
 }
 
-func NewGameHandler(process game.Process, levelService *level.LevelService, gameArchive *gameArchive.GameArchive, levelConfigUtils *levelConfig.LevelConfigUtils, archive *archive.PathResolver) *GameHandler {
+func NewGameHandler(process game.Process, levelService *level.LevelService, gameArchive *gameArchive.GameArchive, levelConfigUtils *levelConfig.LevelConfigUtils, archive *archive.PathResolver, modService *mod.ModService) *GameHandler {
 	return &GameHandler{
 		process:          process,
 		level:            levelService,
 		gameArchive:      gameArchive,
 		levelConfigUtils: levelConfigUtils,
 		archive:          archive,
+		modService:       modService,
 	}
 }
 
@@ -96,6 +99,11 @@ func (p *GameHandler) Start(ctx *gin.Context) {
 	if err != nil {
 		ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: "failed to start game server: " + err.Error()})
 	} else {
+		if p.modService != nil {
+			if trackErr := p.modService.BeginInstallTracking(clusterName); trackErr != nil {
+				log.Println("登记模组安装状态失败:", trackErr)
+			}
+		}
 		ctx.JSON(http.StatusOK, response.Response{Code: 200, Msg: "success"})
 	}
 }
@@ -114,6 +122,11 @@ func (p *GameHandler) StartAll(ctx *gin.Context) {
 	if err != nil {
 		ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: "failed to start all game servers: " + err.Error()})
 	} else {
+		if p.modService != nil {
+			if trackErr := p.modService.BeginInstallTracking(clusterName); trackErr != nil {
+				log.Println("登记模组安装状态失败:", trackErr)
+			}
+		}
 		ctx.JSON(http.StatusOK, response.Response{Code: 200, Msg: "success"})
 	}
 }
