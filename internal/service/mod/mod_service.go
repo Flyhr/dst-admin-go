@@ -213,6 +213,8 @@ type WorkshopItemDetail struct {
 	Timeupdated int64   `json:"timeupdated"`
 	Timelast    float64 `json:"timelast"`
 	Img         string  `json:"img"`
+	// DownloadedAt 该分片模组文件的下载/解压时间（unix 秒），用于区分“模组最后更新”与“本地下装时间”。
+	DownloadedAt int64 `json:"downloadedAt"`
 }
 
 // WorkshopItem ACF文件中的Workshop项
@@ -785,7 +787,10 @@ func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopIte
 		indexes[id] = len(details)
 		modIDs = append(modIDs, id)
 		details = append(details, WorkshopItemDetail{
-			WorkShopId: id, Name: id, Timeupdated: installed[id].TimeUpdated,
+			WorkShopId:   id,
+			Name:         id,
+			Timeupdated:  installed[id].TimeUpdated,
+			DownloadedAt: s.ugcModDownloadedAt(clusterName, levelName, id),
 		})
 	}
 	if len(modIDs) == 0 {
@@ -804,6 +809,19 @@ func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopIte
 		}
 	}
 	return details, nil
+}
+
+// ugcModDownloadedAt 返回该分片模组文件的下载/解压时间（unix 秒）。
+// 优先取 modinfo.lua 的修改时间，缺失时退回模组目录修改时间；不存在返回 0。
+func (s *ModService) ugcModDownloadedAt(clusterName, levelName, modId string) int64 {
+	base := s.pathResolver.GetUgcWorkshopModPath(clusterName, levelName, modId)
+	if info, err := os.Stat(filepath.Join(base, "modinfo.lua")); err == nil {
+		return info.ModTime().Unix()
+	}
+	if info, err := os.Stat(base); err == nil {
+		return info.ModTime().Unix()
+	}
+	return 0
 }
 
 // filterExistingUgcItems 只保留该分片对应文件目录仍存在的 ACF 条目。
