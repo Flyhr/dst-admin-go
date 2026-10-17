@@ -7,7 +7,6 @@ import (
 	"dst-admin-go/internal/service/dstConfig"
 	"dst-admin-go/internal/service/mod"
 	"encoding/json"
-	"log"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -280,9 +279,10 @@ func (h *ModHandler) UpdateMod(ctx *gin.Context) {
 	lang := ctx.DefaultQuery("lang", "zh")
 
 	// 删除旧数据
-	err := h.modService.DeleteMod(clusterName, modId)
+	err := h.modService.ClearModInfoCache(clusterName, modId)
 	if err != nil {
-		log.Println("删除旧模组失败:", err)
+		response.FailWithMessage("清理模组更新缓存失败: "+err.Error(), ctx)
+		return
 	}
 
 	// 重新下载

@@ -481,19 +481,138 @@ func (s *ModService) GetModByModId(modId string) (*model.ModInfo, error) {
 	return &modInfo, err
 }
 
-// DeleteMod 删除模组
-func (s *ModService) DeleteMod(clusterName, modId string) error {
-	// 从数据库删除
-	err := s.db.Where("modid = ?", modId).Delete(&model.ModInfo{}).Error
+// ClearModInfoCache 清除更新所需的元数据和下载缓存，保留世界正在使用的模组文件。
+func (s *ModService) ClearModInfoCache(clusterName, modId string) error {
+	config, err := s.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
 		return err
 	}
+	if isWorkshopId(modId) && config.Mod_download_path != "" {
+		path := filepath.Join(config.Mod_download_path, "steamapps", "workshop", "content", "322330", modId)
+		if err := fileUtils.DeleteDir(path); err != nil {
+			return err
+		}
+	}
+	return s.db.Where("modid = ?", modId).Delete(&model.ModInfo{}).Error
+}
 
-	// 删除本地文件
-	config, _ := s.dstConfig.GetDstConfig(clusterName)
-	modDownloadPath := config.Mod_download_path
-	modPath := filepath.Join(modDownloadPath, "steamapps", "workshop", "content", "322330", modId)
-	return fileUtils.DeleteDir(modPath)
+// DeleteMod 取消订阅并清除未被世界使用的模组。
+func (s *ModService) DeleteMod(clusterName, modId string) error {
+	if modId == "" || strings.Trim(modId, "0123456789") != "" {
+		return errors.New("无效的创意工坊模组 ID")
+	}
+	config, err := s.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return err
+	}
+	if clusterName == "" {
+		clusterName = config.Cluster
+	}
+	usedIn, err := modUsedInAnyWorld(s.pathResolver.KleiBasePath(clusterName), modId)
+	if err != nil {
+		return fmt.Errorf("检查世界模组配置失败: %w", err)
+	}
+	if usedIn != "" {
+		return fmt.Errorf("模组仍在 %s 的世界配置中，请先从该世界移除", usedIn)
+	}
+
+	if config.Force_install_dir != "" {
+		if err := removeModSetupLine(filepath.Join(config.Force_install_dir, "mods", "dedicated_server_mods_setup.lua"), modId); err != nil {
+			return fmt.Errorf("清理模组订阅配置失败: %w", err)
+		}
+	}
+	paths := make(map[string]bool)
+	if config.Mod_download_path != "" {
+		paths[filepath.Join(config.Mod_download_path, "steamapps", "workshop", "content", "322330", modId)] = true
+	}
+	if config.Ugc_directory != "" {
+		paths[filepath.Join(config.Ugc_directory, "content", "322330", modId)] = true
+	}
+	if config.Force_install_dir != "" {
+		paths[filepath.Join(config.Force_install_dir, "mods", "workshop-"+modId)] = true
+		installed, err := filepath.Glob(filepath.Join(config.Force_install_dir, "ugc_mods", "*", "*", "content", "322330", modId))
+		if err != nil {
+			return err
+		}
+		for _, path := range installed {
+			paths[path] = true
+		}
+	}
+	for path := range paths {
+		if err := fileUtils.DeleteDir(path); err != nil {
+			return fmt.Errorf("清理模组文件 %s 失败: %w", path, err)
+		}
+	}
+	if err := s.db.Where("modid = ?", modId).Delete(&model.ModInfo{}).Error; err != nil {
+		return fmt.Errorf("删除模组订阅记录失败: %w", err)
+	}
+	return nil
+}
+
+func modUsedInAnyWorld(kleiBasePath, modId string) (string, error) {
+	clusters, err := os.ReadDir(kleiBasePath)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	key := regexp.MustCompile(`\[\s*["'](?:workshop-)?` + modId + `["']\s*\]`)
+	for _, cluster := range clusters {
+		if !cluster.IsDir() {
+			continue
+		}
+		clusterPath := filepath.Join(kleiBasePath, cluster.Name())
+		worlds, err := os.ReadDir(clusterPath)
+		if err != nil {
+			return "", err
+		}
+		for _, world := range worlds {
+			if !world.IsDir() {
+				continue
+			}
+			content, err := os.ReadFile(filepath.Join(clusterPath, world.Name(), "modoverrides.lua"))
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return "", err
+			}
+			if key.Match(content) {
+				return filepath.Join(cluster.Name(), world.Name()), nil
+			}
+		}
+	}
+	return "", nil
+}
+
+func removeModSetupLine(path, modId string) error {
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	line := regexp.MustCompile(`^ServerModSetup\s*\(\s*["']` + modId + `["']\s*\)(?:\s*--.*)?$`)
+	lines := strings.SplitAfter(string(content), "\n")
+	remaining := make([]string, 0, len(lines))
+	removed := false
+	for _, item := range lines {
+		if line.MatchString(strings.TrimSpace(item)) {
+			removed = true
+			continue
+		}
+		remaining = append(remaining, item)
+	}
+	if !removed {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strings.Join(remaining, "")), info.Mode().Perm())
 }
 
 // UpdateAllModInfos 批量更新所有模组信息
