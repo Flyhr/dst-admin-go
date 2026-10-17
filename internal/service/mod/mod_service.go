@@ -763,18 +763,19 @@ func (s *ModService) AddModInfo(clusterName, lang, modid, modinfo, modDownloadPa
 	return s.addModInfoToDb(clusterName, lang, modid)
 }
 
-// GetUgcModInfo 获取UGC模组信息
+// GetUgcModInfo 获取UGC模组信息（按 ACF 中的最后更新时间从新到旧排序，顺序稳定）。
 func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopItemDetail, error) {
 	acfPath := s.pathResolver.GetUgcAcfPath(clusterName, levelName)
 	installed := s.parseACFFile(acfPath)
-	details := make([]WorkshopItemDetail, 0, len(installed))
-	modIDs := make([]string, 0, len(installed))
-	indexes := make(map[string]int, len(installed))
-	for id, item := range installed {
+	ids := sortedWorkshopItemIDs(installed)
+	details := make([]WorkshopItemDetail, 0, len(ids))
+	modIDs := make([]string, 0, len(ids))
+	indexes := make(map[string]int, len(ids))
+	for _, id := range ids {
 		indexes[id] = len(details)
 		modIDs = append(modIDs, id)
 		details = append(details, WorkshopItemDetail{
-			WorkShopId: id, Name: id, Timeupdated: item.TimeUpdated,
+			WorkShopId: id, Name: id, Timeupdated: installed[id].TimeUpdated,
 		})
 	}
 	if len(modIDs) == 0 {

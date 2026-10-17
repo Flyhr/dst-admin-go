@@ -2,6 +2,7 @@ package mod
 
 import (
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -86,6 +87,23 @@ func parseWorkshopItemsInstalled(filePath string) map[string]WorkshopItem {
 		}
 	}
 	return items
+}
+
+// sortedWorkshopItemIDs 返回稳定的工坊条目顺序：最后更新时间从新到旧，
+// 时间相同时按 id 升序，避免直接遍历 map 导致每次查询顺序都变化。
+func sortedWorkshopItemIDs(items map[string]WorkshopItem) []string {
+	ids := make([]string, 0, len(items))
+	for id := range items {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		left, right := items[ids[i]], items[ids[j]]
+		if left.TimeUpdated == right.TimeUpdated {
+			return ids[i] < ids[j]
+		}
+		return left.TimeUpdated > right.TimeUpdated
+	})
+	return ids
 }
 
 // parseACFItemID 判断一行是否为 ACF 中的工坊条目 id（形如 "1234567890"）。
