@@ -6,6 +6,7 @@ import (
 	"dst-admin-go/internal/service/update"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -31,12 +32,18 @@ func (h *UpdateHandler) RegisterRoute(router *gin.RouterGroup) {
 // @Success 200 {object} response.Response
 // @Router /api/game/update [get]
 func (h *UpdateHandler) Update(ctx *gin.Context) {
-
 	clusterName := context.GetClusterName(ctx)
 
 	err := h.updateService.Update(clusterName)
 	if err != nil {
-		log.Panicln("更新游戏失败: ", err)
+		log.Println("更新游戏失败:", err)
+		// 不再 panic：把 SteamCMD 的错误尾部返回给前端，便于页面提示具体原因。
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: 500,
+			Msg:  updateErrorMessage(err),
+			Data: nil,
+		})
+		return
 	}
 
 	ctx.JSON(http.StatusOK, response.Response{
@@ -44,4 +51,14 @@ func (h *UpdateHandler) Update(ctx *gin.Context) {
 		Msg:  "update dst success",
 		Data: nil,
 	})
+}
+
+// updateErrorMessage 把错误信息裁剪成适合页面展示的长度（保留结尾关键输出）。
+func updateErrorMessage(err error) string {
+	const limit = 800
+	text := strings.TrimSpace(err.Error())
+	if len(text) <= limit {
+		return "更新游戏失败: " + text
+	}
+	return "更新游戏失败: ..." + text[len(text)-limit:]
 }
