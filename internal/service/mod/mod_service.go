@@ -795,79 +795,31 @@ func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopIte
 	return details, nil
 }
 
-// DeleteUgcModFile 删除UGC模组文件
+// DeleteUgcModFile 删除指定分片已下载的 UGC 模组文件，并清理 ACF 中的下载记录。
+// 只删除文件/记录，不取消订阅、不修改世界配置；模组仍在启用列表时，下次启动世界会被重新下载。
 func (s *ModService) DeleteUgcModFile(clusterName, levelName, workshopId string) error {
+	if !isWorkshopId(workshopId) {
+		return errors.New("无效的创意工坊模组 ID")
+	}
 	modFilePath := s.pathResolver.GetUgcWorkshopModPath(clusterName, levelName, workshopId)
 	if fileUtils.Exists(modFilePath) {
-		return fileUtils.DeleteDir(modFilePath)
+		if err := fileUtils.DeleteDir(modFilePath); err != nil {
+			return err
+		}
+	}
+	// 同步清理 appworkshop_322330.acf，否则刷新后列表仍会从 ACF 记录里读回该模组。
+	acfPath := s.pathResolver.GetUgcAcfPath(clusterName, levelName)
+	if _, err := removeACFWorkshopItem(acfPath, workshopId); err != nil {
+		return fmt.Errorf("清理 UGC 下载记录失败: %w", err)
 	}
 	return nil
 }
 
 // ===== 私有方法 =====
 
-// parseACFFile 解析ACF文件
+// parseACFFile 解析 ACF 文件中的已安装工坊条目（只读 WorkshopItemsInstalled 段）。
 func (s *ModService) parseACFFile(filePath string) map[string]WorkshopItem {
-	lines, err := fileUtils.ReadLnFile(filePath)
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-	parsingWorkshopItemsInstalled := false
-	workshopItems := make(map[string]WorkshopItem)
-	var currentItemID string
-	var currentItem WorkshopItem
-
-	for _, line := range lines {
-		if strings.Contains(line, "WorkshopItemsInstalled") {
-			parsingWorkshopItemsInstalled = true
-			continue
-		}
-
-		if strings.Contains(line, "{") && parsingWorkshopItemsInstalled {
-			continue
-		}
-
-		if strings.Contains(line, "}") {
-			continue
-		}
-
-		if parsingWorkshopItemsInstalled {
-			replace := strings.Replace(line, "\t\t", "", -1)
-			replace = strings.Replace(replace, "\"", "", -1)
-			if _, err := strconv.Atoi(replace); err == nil {
-				// This line contains the Workshop Item ID
-				fields := strings.Fields(line)
-				value := strings.Replace(fields[0], "\"", "", -1)
-				currentItemID = value
-			} else {
-				// This line contains the Workshop Item details
-				fields := strings.Fields(line)
-				if len(fields) == 2 {
-					key := strings.Replace(fields[0], "\"", "", -1)
-					value := strings.Replace(fields[1], "\"", "", -1)
-					// Remove double quotes from keys
-					key = strings.ReplaceAll(key, "\"", "")
-					switch key {
-					case "timeupdated":
-						currentItem.TimeUpdated, _ = strconv.ParseInt(value, 10, 64)
-					case "manifest":
-						currentItem.Manifest = strings.ReplaceAll(value, "\"", "")
-					case "ugchandle":
-						currentItem.Ugchandle = strings.ReplaceAll(value, "\"", "")
-					}
-				}
-			}
-
-			if currentItemID != "" && currentItem.TimeUpdated != 0 {
-				workshopItems[currentItemID] = currentItem
-				currentItemID = ""
-				currentItem = WorkshopItem{}
-			}
-		}
-	}
-
-	return workshopItems
+	return parseWorkshopItemsInstalled(filePath)
 }
 
 // getModInfoConfig 获取mod配置信息；本地与缓存都没有 modinfo.lua 时下载，失败返回错误。
