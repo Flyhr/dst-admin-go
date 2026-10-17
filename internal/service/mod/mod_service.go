@@ -775,7 +775,7 @@ func (s *ModService) AddModInfo(clusterName, lang, modid, modinfo, modDownloadPa
 	return s.addModInfoToDb(clusterName, lang, modid)
 }
 
-// GetUgcModInfo 获取UGC模组信息（只显示该分片实际存在文件的条目，按最后更新时间从新到旧排序）。
+// GetUgcModInfo 获取UGC模组信息（只显示该分片实际存在文件的条目，按下载时间从新到旧排序）。
 func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopItemDetail, error) {
 	acfPath := s.pathResolver.GetUgcAcfPath(clusterName, levelName)
 	installed := s.filterExistingUgcItems(clusterName, levelName, s.parseACFFile(acfPath))
@@ -793,13 +793,14 @@ func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopIte
 			DownloadedAt: s.ugcModDownloadedAt(clusterName, levelName, id),
 		})
 	}
+	// Steam 元数据合并使用追加顺序的 indexes，因此排序放在合并之后进行。
 	if len(modIDs) == 0 {
 		return details, nil
 	}
 	// Installed files remain visible when Steam metadata is temporarily unavailable.
 	published, err := s.getPublishedFileDetailsBatched(modIDs, 20)
 	if err != nil {
-		return details, nil
+		return sortUgcDetailsByDownloadTime(details), nil
 	}
 	for _, item := range published {
 		if index, ok := indexes[item.Publishedfileid]; ok {
@@ -808,7 +809,8 @@ func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopIte
 			details[index].Timelast = item.TimeUpdated
 		}
 	}
-	return details, nil
+	// 列表按下载时间从新到旧展示；时间相同时沿用 ACF 最后更新时间顺序（稳定排序）。
+	return sortUgcDetailsByDownloadTime(details), nil
 }
 
 // ugcModDownloadedAt 返回该分片模组文件的下载/解压时间（unix 秒）。

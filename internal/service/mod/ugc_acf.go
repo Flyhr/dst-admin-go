@@ -106,6 +106,16 @@ func sortedWorkshopItemIDs(items map[string]WorkshopItem) []string {
 	return ids
 }
 
+// sortUgcDetailsByDownloadTime 返回按“下载时间”从新到旧排序的副本。
+// 下载时间相同的条目保持原有相对顺序（调用方已先按最后更新时间排好序，作为稳定兜底）。
+func sortUgcDetailsByDownloadTime(details []WorkshopItemDetail) []WorkshopItemDetail {
+	sorted := append([]WorkshopItemDetail(nil), details...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].DownloadedAt > sorted[j].DownloadedAt
+	})
+	return sorted
+}
+
 // parseACFItemID 判断一行是否为 ACF 中的工坊条目 id（形如 "1234567890"）。
 func parseACFItemID(line string) (string, bool) {
 	if len(line) < 3 || !strings.HasPrefix(line, `"`) || !strings.HasSuffix(line, `"`) {
