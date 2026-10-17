@@ -105,6 +105,7 @@ func (h *ModHandler) GetModInfo(ctx *gin.Context) {
 		"v":             modinfo.V,
 		"mod_config":    modConfig,
 		"update":        modinfo.Update,
+		"downloaded":    true,
 	}
 
 	response.OkWithData(modData, ctx)
@@ -144,6 +145,7 @@ func (h *ModHandler) GetMyModList(ctx *gin.Context) {
 			"mod_config":    modConfig,
 			"update":        modinfo.Update,
 			"installed":     modinfo.Installed,
+			"downloaded":    modinfo.Downloaded,
 		}
 		modDataList = append(modDataList, modData)
 	}
@@ -308,6 +310,7 @@ func (h *ModHandler) UpdateMod(ctx *gin.Context) {
 		"v":             modinfo.V,
 		"mod_config":    modConfig,
 		"update":        modinfo.Update,
+		"downloaded":    true,
 	}
 
 	response.OkWithData(modData, ctx)

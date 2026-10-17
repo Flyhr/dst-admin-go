@@ -29,6 +29,7 @@ func (s *ModService) mergeInstalledMods(clusterName, lang string, mods []model.M
 	indexes := make(map[string]int, len(mods))
 	for i := range mods {
 		mods[i].Installed = false
+		mods[i].Downloaded = false
 		indexes[mods[i].Modid] = i
 	}
 	seen := make(map[string]bool)
@@ -50,7 +51,9 @@ func (s *ModService) mergeInstalledMods(clusterName, lang string, mods []model.M
 				mods = append(mods, model.ModInfo{Modid: id})
 			}
 			item := &mods[index]
+			// 游戏目录里已有 modinfo.lua，说明模组文件已经安装到游戏侧，自然也已下载。
 			item.Installed = true
+			item.Downloaded = true
 			metadata := s.readModInfo(lang, id, path)
 			if name, ok := metadata["name"].(string); ok && (item.Name == "" || item.Name == id) {
 				item.Name = name
@@ -71,6 +74,25 @@ func (s *ModService) mergeInstalledMods(clusterName, lang string, mods []model.M
 				if data, err := json.Marshal(metadata); err == nil {
 					item.ModConfig = string(data)
 				}
+			}
+		}
+	}
+
+	// 面板下载缓存里有 modinfo.lua 的模组同样视为已下载；这里只标记列表中已有的条目
+	//（数据库订阅记录或已安装项），不使用缓存文件新增条目，列表保持只读。
+	if config.Mod_download_path != "" {
+		cachePattern := filepath.Join(config.Mod_download_path, "steamapps", "workshop", "content", "322330", "*", "modinfo.lua")
+		files, err := filepath.Glob(cachePattern)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range files {
+			id := filepath.Base(filepath.Dir(path))
+			if !isWorkshopId(id) {
+				continue
+			}
+			if index, exists := indexes[id]; exists {
+				mods[index].Downloaded = true
 			}
 		}
 	}
