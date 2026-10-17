@@ -582,6 +582,10 @@ func (s *ModService) DeleteMod(clusterName, modId string) error {
 			return fmt.Errorf("清理模组文件 %s 失败: %w", path, err)
 		}
 	}
+	// 取消订阅时同步清掉各分片 ACF 记录与下载中间状态，避免 UGC 页刷新后又出现。
+	if err := s.cleanupUgcForMod(clusterName, modId); err != nil {
+		return fmt.Errorf("清理 UGC 记录失败: %w", err)
+	}
 	if err := s.db.Where("modid = ?", modId).Delete(&model.ModInfo{}).Error; err != nil {
 		return fmt.Errorf("删除模组订阅记录失败: %w", err)
 	}
@@ -763,10 +767,10 @@ func (s *ModService) AddModInfo(clusterName, lang, modid, modinfo, modDownloadPa
 	return s.addModInfoToDb(clusterName, lang, modid)
 }
 
-// GetUgcModInfo 获取UGC模组信息（按 ACF 中的最后更新时间从新到旧排序，顺序稳定）。
+// GetUgcModInfo 获取UGC模组信息（只显示该分片实际存在文件的条目，按最后更新时间从新到旧排序）。
 func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopItemDetail, error) {
 	acfPath := s.pathResolver.GetUgcAcfPath(clusterName, levelName)
-	installed := s.parseACFFile(acfPath)
+	installed := s.filterExistingUgcItems(clusterName, levelName, s.parseACFFile(acfPath))
 	ids := sortedWorkshopItemIDs(installed)
 	details := make([]WorkshopItemDetail, 0, len(ids))
 	modIDs := make([]string, 0, len(ids))
@@ -796,7 +800,23 @@ func (s *ModService) GetUgcModInfo(clusterName, levelName string) ([]WorkshopIte
 	return details, nil
 }
 
-// DeleteUgcModFile 删除指定分片已下载的 UGC 模组文件，并清理 ACF 中的下载记录。
+// filterExistingUgcItems 只保留该分片对应文件目录仍存在的 ACF 条目。
+// 游戏运行期间会按自己的状态重写 ACF：即便面板删掉了文件和记录，重启世界后
+// 记录也可能被重新写回（文件却不存在），因此展示时必须再按实际文件过滤一次。
+func (s *ModService) filterExistingUgcItems(clusterName, levelName string, items map[string]WorkshopItem) map[string]WorkshopItem {
+	if len(items) == 0 {
+		return items
+	}
+	filtered := make(map[string]WorkshopItem, len(items))
+	for id, item := range items {
+		if fileUtils.Exists(s.pathResolver.GetUgcWorkshopModPath(clusterName, levelName, id)) {
+			filtered[id] = item
+		}
+	}
+	return filtered
+}
+
+// DeleteUgcModFile 删除指定分片已下载的 UGC 模组文件，并清理 ACF 记录与下载中间状态。
 // 只删除文件/记录，不取消订阅、不修改世界配置；模组仍在启用列表时，下次启动世界会被重新下载。
 func (s *ModService) DeleteUgcModFile(clusterName, levelName, workshopId string) error {
 	if !isWorkshopId(workshopId) {
@@ -813,7 +833,85 @@ func (s *ModService) DeleteUgcModFile(clusterName, levelName, workshopId string)
 	if _, err := removeACFWorkshopItem(acfPath, workshopId); err != nil {
 		return fmt.Errorf("清理 UGC 下载记录失败: %w", err)
 	}
+	// 清理下载中间文件，避免游戏按残留状态把记录又恢复回来。
+	s.deleteUgcDownloadState(clusterName, levelName, workshopId)
 	return nil
+}
+
+// ugcShardBase 返回分片 UGC 目录：配置了 ugc_directory 时为其本身，
+// 否则为 <install>/ugc_mods/<cluster>/<level>。
+func (s *ModService) ugcShardBase(clusterName, levelName string) (string, bool) {
+	config, err := s.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return "", false
+	}
+	if config.Ugc_directory != "" {
+		return config.Ugc_directory, true
+	}
+	if config.Force_install_dir == "" {
+		return "", false
+	}
+	return filepath.Join(config.Force_install_dir, "ugc_mods", clusterName, levelName), true
+}
+
+// deleteUgcDownloadState 清理某条目的下载中间文件与状态补丁（尽力而为，不阻断删除）。
+func (s *ModService) deleteUgcDownloadState(clusterName, levelName, workshopId string) {
+	base, ok := s.ugcShardBase(clusterName, levelName)
+	if !ok {
+		return
+	}
+	if err := fileUtils.DeleteDir(filepath.Join(base, "downloads", "322330", workshopId)); err != nil {
+		log.Println("清理 UGC 下载中间文件失败:", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(base, "downloads", "state_322330_322330_"+workshopId+".patch*"))
+	if err != nil {
+		return
+	}
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			log.Println("清理 UGC 下载状态文件失败:", err)
+		}
+	}
+}
+
+// cleanupUgcForMod 取消订阅时清理所有分片的 ACF 记录、下载中间状态与旧版共享目录。
+func (s *ModService) cleanupUgcForMod(clusterName, modId string) error {
+	config, err := s.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return err
+	}
+	if config.Ugc_directory != "" {
+		if _, err := removeACFWorkshopItem(filepath.Join(config.Ugc_directory, "appworkshop_322330.acf"), modId); err != nil {
+			return err
+		}
+		return fileUtils.DeleteDir(filepath.Join(config.Ugc_directory, "content", "322330", modId))
+	}
+	if config.Force_install_dir == "" {
+		return nil
+	}
+	clusterRoot := filepath.Join(config.Force_install_dir, "ugc_mods", clusterName)
+	acfs, err := filepath.Glob(filepath.Join(clusterRoot, "*", "appworkshop_322330.acf"))
+	if err != nil {
+		return err
+	}
+	for _, acf := range acfs {
+		if _, err := removeACFWorkshopItem(acf, modId); err != nil {
+			return fmt.Errorf("清理 %s 的 UGC 记录失败: %w", acf, err)
+		}
+	}
+	shardDirs, err := filepath.Glob(filepath.Join(clusterRoot, "*"))
+	if err != nil {
+		return err
+	}
+	for _, shardDir := range shardDirs {
+		info, statErr := os.Stat(shardDir)
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		s.deleteUgcDownloadState(clusterName, filepath.Base(shardDir), modId)
+	}
+	// 旧格式共享目录（ugc_mods/content/322330/<id>）。
+	return fileUtils.DeleteDir(filepath.Join(config.Force_install_dir, "ugc_mods", "content", "322330", modId))
 }
 
 // ===== 私有方法 =====
