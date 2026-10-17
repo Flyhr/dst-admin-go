@@ -288,15 +288,11 @@ func CreateFileIfNotExists(path string) error {
 		return err
 	}
 
-	// 创建文件
-	_, err = os.Create(path)
+	file, err := os.Create(path)
 	if err != nil {
-		// 创建文件失败，返回错误信息
 		return err
 	}
-
-	// 创建成功，返回 nil
-	return nil
+	return file.Close()
 }
 
 func CreateDirIfNotExists(filepath string) {
