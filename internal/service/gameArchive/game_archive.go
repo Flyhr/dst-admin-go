@@ -183,7 +183,7 @@ func (d *GameArchive) GetGameArchive(clusterName string) GameArchiveInfo {
 			}
 		}()
 		localVersion, _ := d.archive.GetLocalDstVersion(clusterName)
-		version, _ := d.archive.GetLastDstVersion()
+		version, _ := d.archive.GetLastDstVersion(clusterName)
 
 		gameArchie.Version = localVersion
 		gameArchie.LastVersion = version

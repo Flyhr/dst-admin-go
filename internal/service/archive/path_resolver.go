@@ -1,23 +1,25 @@
 package archive
 
 import (
-	"dst-admin-go/internal/config"
 	"dst-admin-go/internal/pkg/utils/fileUtils"
 	"dst-admin-go/internal/service/dstConfig"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 )
 
 type PathResolver struct {
 	homePath  string
 	dstConfig dstConfig.Config
+
+	// 最新版本查询缓存：避免每次刷新面板都启动 SteamCMD。
+	versionCacheMu sync.Mutex
+	versionFetchMu sync.Mutex
+	versionCache   map[int]dstVersionCacheEntry
 }
 
 func NewPathResolver(dstConfig dstConfig.Config) (*PathResolver, error) {
@@ -29,8 +31,9 @@ func NewPathResolver(dstConfig dstConfig.Config) (*PathResolver, error) {
 	}
 
 	return &PathResolver{
-		homePath:  home,
-		dstConfig: dstConfig,
+		homePath:     home,
+		dstConfig:    dstConfig,
+		versionCache: map[int]dstVersionCacheEntry{},
 	}, nil
 }
 
@@ -208,26 +211,8 @@ func (r *PathResolver) GetLocalDstVersion(clusterName string) (int64, error) {
 	return r.dstVersion(versionTextPath)
 }
 
-func (r *PathResolver) GetLastDstVersion() (int64, error) {
-	url := config.Cfg.DstVersionUrl
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		log.Println(err)
-		return -1, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err)
-		return -1, err
-	}
-	s := string(body)
-	veriosn, err := strconv.Atoi(s)
-	if err != nil {
-		veriosn = 0
-	}
-	return int64(veriosn), nil
+func (r *PathResolver) GetLastDstVersion(clusterName string) (int64, error) {
+	return r.getLastDstVersion(clusterName)
 }
 
 func (r *PathResolver) dstVersion(versionTextPath string) (int64, error) {
