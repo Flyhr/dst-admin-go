@@ -10,22 +10,38 @@ import (
 	"dst-admin-go/internal/service/archive"
 	"dst-admin-go/internal/service/dstConfig"
 	"dst-admin-go/internal/service/game"
+	"dst-admin-go/internal/service/levelConfig"
+	"dst-admin-go/internal/service/maintenance"
+	"dst-admin-go/internal/service/mod"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	// 快照备份默认间隔（分钟）与保留数量，保持前后端一致。
+	snapshotDefaultInterval = 36
+	snapshotDefaultMax      = 6
+	// 快照开关关闭时的轮询间隔。
+	snapshotDisabledPollInterval = time.Minute
+)
+
 type BackupService struct {
-	archive     *archive.PathResolver
-	dstConfig   dstConfig.Config
-	gameProcess game.Process
+	archive          *archive.PathResolver
+	dstConfig        dstConfig.Config
+	gameProcess      game.Process
+	levelConfigUtils *levelConfig.LevelConfigUtils
+	modService       *mod.ModService
+	snapshotOnce     sync.Once
 }
 
 type BackupInfo struct {
@@ -42,30 +58,44 @@ type BackupSnapshot struct {
 	IsCSave      int `json:"isCSave"`
 }
 
-func NewBackupService(archive *archive.PathResolver, dstConfig dstConfig.Config, gameProcess game.Process) *BackupService {
+func NewBackupService(
+	archive *archive.PathResolver,
+	dstConfig dstConfig.Config,
+	gameProcess game.Process,
+	levelConfigUtils *levelConfig.LevelConfigUtils,
+	modService *mod.ModService,
+) *BackupService {
 	return &BackupService{
-		archive:     archive,
-		dstConfig:   dstConfig,
-		gameProcess: gameProcess,
+		archive:          archive,
+		dstConfig:        dstConfig,
+		gameProcess:      gameProcess,
+		levelConfigUtils: levelConfigUtils,
+		modService:       modService,
 	}
 }
 
-func (b *BackupService) GetBackupList(clusterName string) []BackupInfo {
+// StartSnapshotScheduler 启动自动快照备份调度（进程内只启动一次）。
+func (b *BackupService) StartSnapshotScheduler() {
+	b.snapshotOnce.Do(func() {
+		go b.ScheduleBackupSnapshots()
+	})
+}
+
+func (b *BackupService) GetBackupList(clusterName string) ([]BackupInfo, error) {
 	config, err := b.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return []BackupInfo{}
+		return nil, fmt.Errorf("读取配置失败: %w", err)
 	}
 	backupPath := config.Backup
 	var backupList []BackupInfo
 
 	if !fileUtils.Exists(backupPath) {
-		return backupList
+		return backupList, nil
 	}
 	//获取文件或目录相关信息
 	fileInfoList, err := ioutil.ReadDir(backupPath)
 	if err != nil {
-		log.Panicln(err)
+		return nil, fmt.Errorf("读取备份目录失败: %w", err)
 	}
 
 	for _, file := range fileInfoList {
@@ -84,7 +114,7 @@ func (b *BackupService) GetBackupList(clusterName string) []BackupInfo {
 		}
 	}
 
-	return backupList
+	return backupList, nil
 
 }
 
@@ -341,46 +371,56 @@ func safeBackupPath(backupDir, fileName string, mustExist bool) (string, error) 
 	return fullPath, nil
 }
 
+// ScheduleBackupSnapshots 自动快照备份循环：按数据库中的设置定时创建快照并清理旧快照。
+// 由 StartSnapshotScheduler 以 goroutine 方式启动，进程内只启动一次。
 func (b *BackupService) ScheduleBackupSnapshots() {
-	log.Println("开始创建快照")
+	log.Println("自动快照备份调度已启动")
 	for {
-		db := database.Db
 		snapshot := model.BackupSnapshot{}
-		db.First(&snapshot)
-		if snapshot.Enable == 1 {
-			if snapshot.Interval == 0 {
-				snapshot.Interval = 8
-			}
-			if snapshot.MaxSnapshots == 0 {
-				snapshot.MaxSnapshots = 6
-			}
-			time.Sleep(time.Duration(snapshot.Interval) * time.Minute)
+		database.Db.First(&snapshot)
 
-			// 定时创建备份,每隔 x 分钟备份一次
-			// Get the first available cluster config (or "MyCluster" as default)
-			clusterName := "MyCluster"
-			config, err := b.dstConfig.GetDstConfig(clusterName)
-			if err != nil {
-				log.Println("failed to get dst config for snapshot:", err)
-				continue
+		interval := snapshot.Interval
+		if interval <= 0 {
+			interval = snapshotDefaultInterval
+		}
+		maxSnapshots := snapshot.MaxSnapshots
+		if maxSnapshots <= 0 {
+			maxSnapshots = snapshotDefaultMax
+		}
+
+		if snapshot.Enable != 1 {
+			time.Sleep(snapshotDisabledPollInterval)
+			continue
+		}
+
+		// 到达间隔后执行一次快照；等待期间关闭开关会在下一次循环生效。
+		time.Sleep(time.Duration(interval) * time.Minute)
+
+		config, err := b.dstConfig.GetDstConfig("")
+		if err != nil || config.Cluster == "" {
+			log.Println("[Snapshot]跳过快照：无法获取集群配置:", err)
+			continue
+		}
+		if current := maintenance.Current(); current.Active {
+			log.Printf("[Snapshot]跳过快照：%s正在进行", current.Kind)
+			continue
+		}
+
+		if snapshot.IsCSave == 1 {
+			if cmdErr := b.gameProcess.Command(config.Cluster, "Master", "c_save()"); cmdErr != nil {
+				log.Println("[Snapshot]CSave command error:", cmdErr)
 			}
-			if config.Cluster != "" {
-				snapshotPrefix := "(snapshot)"
-				if snapshot.IsCSave == 1 {
-					// 执行 CSave 命令
-					err := b.gameProcess.Command(config.Cluster, "Master", "c_save()")
-					if err != nil {
-						log.Println("CSave command error:", err)
-					}
-					// 等待保存完成
-					time.Sleep(2 * time.Second)
-				}
-				b.CreateSnapshotBackup(snapshotPrefix, config.Cluster)
-				// 删除快照
-				b.DeleteBackupSnapshots(snapshotPrefix, snapshot.MaxSnapshots, config.Cluster, config.Backup)
-			}
-		} else {
-			time.Sleep(1 * time.Minute)
+			// 等待存档保存（世界保存为异步，给足时间；不阻塞其他操作）。
+			time.Sleep(2 * time.Second)
+		}
+
+		snapshotPrefix := "(snapshot)"
+		if err := b.CreateSnapshotBackup(snapshotPrefix, config.Cluster); err != nil {
+			log.Println("[Snapshot]创建快照失败:", err)
+			continue
+		}
+		if err := b.DeleteBackupSnapshots(snapshotPrefix, maxSnapshots, config.Cluster, config.Backup); err != nil {
+			log.Println("[Snapshot]清理旧快照失败:", err)
 		}
 	}
 }
@@ -395,53 +435,61 @@ func sumMd5(filePath string) string {
 	return info
 }
 
-func (b *BackupService) CreateSnapshotBackup(prefix, clusterName string) {
-
+func (b *BackupService) CreateSnapshotBackup(prefix, clusterName string) error {
 	config, err := b.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
+		return fmt.Errorf("读取配置失败: %w", err)
 	}
-
-	snapshotMd5FilePath := "./snapshotMd5"
-	fileUtils.CreateFileIfNotExists(snapshotMd5FilePath)
-
+	if !fileUtils.Exists(config.Backup) {
+		return fmt.Errorf("备份目录不存在: %s", config.Backup)
+	}
 	src := b.archive.ClusterPath(clusterName)
 	dst := filepath.Join(config.Backup, b.GenBackUpSnapshotName(prefix, clusterName))
 	log.Println("[Snapshot]正在定时创建游戏备份", "src: ", src, "dst: ", dst)
-	err = zip.Zip(src, dst)
-	if err != nil {
-		log.Println("[Snapshot]create backup error", err)
+	if zipErr := zip.Zip(src, dst); zipErr != nil {
+		return fmt.Errorf("创建快照失败: %w", zipErr)
 	}
+	return nil
 }
 
-func (b *BackupService) DeleteBackupSnapshots(prefix string, maxSnapshots int, clusterName, backupPath string) {
-
-	log.Println("[Snapshot]正在删除快照备份", "maxSnapshots", maxSnapshots, "clusterName: ", clusterName)
-
-	backupList := b.GetBackupList(clusterName)
-	var newBackupList []BackupInfo
+// DeleteBackupSnapshots 删除超出保留数量的旧快照（按创建时间从旧到新删除，且只处理当前集群）。
+func (b *BackupService) DeleteBackupSnapshots(prefix string, maxSnapshots int, clusterName, backupPath string) error {
+	if maxSnapshots <= 0 {
+		maxSnapshots = snapshotDefaultMax
+	}
+	backupList, err := b.GetBackupList(clusterName)
+	if err != nil {
+		return err
+	}
+	var snapshots []BackupInfo
 	for i := range backupList {
 		name := backupList[i].FileName
-		if strings.HasPrefix(name, prefix) {
-			newBackupList = append(newBackupList, backupList[i])
+		if strings.HasPrefix(name, prefix) && strings.Contains(name, clusterName) {
+			snapshots = append(snapshots, backupList[i])
 		}
 	}
-	if len(newBackupList) > maxSnapshots {
-		deleteBackupList := newBackupList[:len(newBackupList)-maxSnapshots]
-		for i := range deleteBackupList {
-			filePath := filepath.Join(backupPath, deleteBackupList[i].FileName)
-			log.Println("删除快照备份", filePath)
-			if !fileUtils.Exists(filePath) {
-				continue
-			}
-			err := fileUtils.DeleteFile(filePath)
-			if err != nil {
-				return
-			}
+	if len(snapshots) <= maxSnapshots {
+		return nil
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].CreateTime.Before(snapshots[j].CreateTime)
+	})
+	deleteList := snapshots[:len(snapshots)-maxSnapshots]
+	var errs []string
+	for i := range deleteList {
+		filePath := filepath.Join(backupPath, deleteList[i].FileName)
+		if !fileUtils.Exists(filePath) {
+			continue
+		}
+		log.Println("[Snapshot]删除旧快照", filePath)
+		if delErr := fileUtils.DeleteFile(filePath); delErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", deleteList[i].FileName, delErr))
 		}
 	}
-
+	if len(errs) > 0 {
+		return fmt.Errorf("删除旧快照失败: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (b *BackupService) backupPath() string {

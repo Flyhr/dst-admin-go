@@ -105,10 +105,16 @@ func downloadContentDisposition(fileName string) string {
 // @Router /api/game/backup [get]
 func (h *BackupHandler) GetBackupList(ctx *gin.Context) {
 	clusterName := context.GetClusterName(ctx)
+	list, err := h.backupService.GetBackupList(clusterName)
+	if err != nil {
+		log.Println("获取备份列表失败:", err)
+		fail(ctx, err)
+		return
+	}
 	ctx.JSON(http.StatusOK, response.Response{
 		Code: 200,
 		Msg:  "get backup list success",
-		Data: h.backupService.GetBackupList(clusterName),
+		Data: list,
 	})
 }
 
@@ -234,7 +240,11 @@ func (h *BackupHandler) BackupSnapshotsList(ctx *gin.Context) {
 	clusterName := context.GetClusterName(ctx)
 
 	var snapshotBackupList []backup.BackupInfo
-	backupList := h.backupService.GetBackupList(clusterName)
+	backupList, err := h.backupService.GetBackupList(clusterName)
+	if err != nil {
+		fail(ctx, err)
+		return
+	}
 	for i := range backupList {
 		name := backupList[i].FileName
 		if strings.HasPrefix(name, "(snapshot)") && strings.Contains(name, clusterName) {
