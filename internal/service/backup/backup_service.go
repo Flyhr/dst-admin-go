@@ -3,7 +3,6 @@ package backup
 import (
 	"dst-admin-go/internal/database"
 	"dst-admin-go/internal/model"
-	"dst-admin-go/internal/pkg/context"
 	"dst-admin-go/internal/pkg/utils/dstUtils"
 	"dst-admin-go/internal/pkg/utils/fileUtils"
 	"dst-admin-go/internal/pkg/utils/shellUtils"
@@ -11,6 +10,8 @@ import (
 	"dst-admin-go/internal/service/archive"
 	"dst-admin-go/internal/service/dstConfig"
 	"dst-admin-go/internal/service/game"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -87,162 +88,257 @@ func (b *BackupService) GetBackupList(clusterName string) []BackupInfo {
 
 }
 
-func (b *BackupService) RenameBackup(ctx *gin.Context, fileName, newName string) {
-	clusterName := context.GetClusterName(ctx)
+func (b *BackupService) RenameBackup(clusterName, fileName, newName string) error {
 	config, err := b.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
+		return fmt.Errorf("读取配置失败: %w", err)
 	}
 	backupPath := config.Backup
-	err = fileUtils.Rename(filepath.Join(backupPath, fileName), filepath.Join(backupPath, newName))
+	sourcePath, err := safeBackupPath(backupPath, fileName, true)
 	if err != nil {
-		return
+		return err
 	}
+	oldExt := strings.ToLower(filepath.Ext(fileName))
+
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return errors.New("新备份名称不能为空")
+	}
+	if filepath.Base(newName) != newName || strings.ContainsAny(newName, `/\`) {
+		return errors.New("新备份名称不能包含路径分隔符")
+	}
+	newExt := strings.ToLower(filepath.Ext(newName))
+	if newExt == "" {
+		newName += oldExt
+	} else if newExt != oldExt {
+		return fmt.Errorf("新备份名称扩展名必须与原文件一致（%s）", oldExt)
+	}
+	targetPath, err := safeBackupPath(backupPath, newName, false)
+	if err != nil {
+		return err
+	}
+	if fileUtils.Exists(targetPath) {
+		return fmt.Errorf("目标备份已存在: %s", newName)
+	}
+	if err := fileUtils.Rename(sourcePath, targetPath); err != nil {
+		return fmt.Errorf("重命名失败: %w", err)
+	}
+	return nil
 }
 
-func (b *BackupService) DeleteBackup(ctx *gin.Context, fileNames []string) {
-
-	clusterName := context.GetClusterName(ctx)
+func (b *BackupService) DeleteBackup(clusterName string, fileNames []string) error {
+	if len(fileNames) == 0 {
+		return errors.New("未选择要删除的备份")
+	}
 	config, err := b.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
+		return fmt.Errorf("读取配置失败: %w", err)
 	}
 	backupPath := config.Backup
+	var errs []string
 	for _, fileName := range fileNames {
-		filePath := filepath.Join(backupPath, fileName)
-		if !fileUtils.Exists(filePath) {
+		filePath, pathErr := safeBackupPath(backupPath, fileName, true)
+		if pathErr != nil {
+			errs = append(errs, pathErr.Error())
 			continue
 		}
-		err := fileUtils.DeleteFile(filePath)
-		if err != nil {
-			return
+		if delErr := fileUtils.DeleteFile(filePath); delErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", fileName, delErr))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("删除备份失败: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// BackupFilePath 返回备份文件的绝对路径，供下载使用；会校验文件名与路径安全。
+func (b *BackupService) BackupFilePath(clusterName, fileName string) (string, error) {
+	config, err := b.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return "", fmt.Errorf("读取配置失败: %w", err)
+	}
+	return safeBackupPath(config.Backup, fileName, true)
+}
+
+// RestoreBackup 恢复存档：
+//  1. 停止所有世界；
+//  2. 自动备份当前存档（恢复失败可回滚）；
+//  3. 先解压到临时目录并校验 cluster.ini，再替换当前存档目录；
+//  4. 重新生成 mods 安装清单；
+//  5. 重新启动世界。
+func (b *BackupService) RestoreBackup(clusterName, backupName string) error {
+	config, err := b.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return fmt.Errorf("读取配置失败: %w", err)
+	}
+	backupPath := config.Backup
+	sourcePath, err := safeBackupPath(backupPath, backupName, true)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(filepath.Ext(sourcePath), ".zip") {
+		return errors.New("存档恢复只支持 .zip 备份文件")
+	}
+
+	// 1. 停止所有世界；失败时尝试恢复运行并返回错误。
+	if b.gameProcess != nil {
+		if stopErr := b.gameProcess.StopAll(clusterName); stopErr != nil {
+			_ = b.gameProcess.StartAll(clusterName)
+			return fmt.Errorf("停止世界失败，已取消恢复: %w", stopErr)
+		}
+	}
+	restartWorlds := func() error {
+		if b.gameProcess == nil {
+			return nil
+		}
+		return b.gameProcess.StartAll(clusterName)
+	}
+
+	clusterPath := b.archive.ClusterPath(clusterName)
+	// 2. 恢复前先备份当前存档（失败则回滚）。
+	safetyName := "(restore-safety)" + b.GenGameBackUpName(clusterName)
+	safetyPath := filepath.Join(backupPath, safetyName)
+	if zipErr := zip.Zip(clusterPath, safetyPath); zipErr != nil {
+		_ = restartWorlds()
+		return fmt.Errorf("恢复前备份当前存档失败，已取消恢复: %w", zipErr)
+	}
+
+	// 3. 先解压到集群同级临时目录并校验，成功后再替换，避免备份损坏导致丢失当前存档。
+	parentDir := filepath.Dir(clusterPath)
+	tempDir, err := os.MkdirTemp(parentDir, ".restore-tmp-")
+	if err != nil {
+		_ = restartWorlds()
+		return fmt.Errorf("创建临时目录失败: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if unzipErr := zip.Unzip3(sourcePath, tempDir); unzipErr != nil {
+		_ = restartWorlds()
+		return fmt.Errorf("备份文件无效或解压失败，当前存档未改动: %w", unzipErr)
+	}
+	if !fileUtils.Exists(filepath.Join(tempDir, "cluster.ini")) {
+		_ = restartWorlds()
+		return errors.New("备份包中缺少 cluster.ini，当前存档未改动")
+	}
+
+	oldPath := clusterPath + ".restore-old-" + time.Now().Format("20060102150405")
+	if renameErr := os.Rename(clusterPath, oldPath); renameErr != nil {
+		_ = restartWorlds()
+		return fmt.Errorf("替换当前存档失败: %w", renameErr)
+	}
+	if renameErr := os.Rename(tempDir, clusterPath); renameErr != nil {
+		_ = os.Rename(oldPath, clusterPath)
+		_ = restartWorlds()
+		return fmt.Errorf("应用新存档失败，已回滚: %w", renameErr)
+	}
+	_ = os.RemoveAll(oldPath)
+
+	// 4. 重新生成 mods 安装清单。
+	if modoverride, readErr := fileUtils.ReadFile(b.archive.ModoverridesPath(clusterName, "Master")); readErr == nil {
+		if modConfig, cfgErr := b.dstConfig.GetDstConfig(clusterName); cfgErr == nil {
+			if setupErr := dstUtils.DedicatedServerModsSetup(modConfig, modoverride); setupErr != nil {
+				log.Println("恢复后重建模组安装清单失败:", setupErr)
+			}
 		}
 	}
 
+	// 5. 重新启动世界；启动失败时如实返回（存档已恢复）。
+	if startErr := restartWorlds(); startErr != nil {
+		return fmt.Errorf("存档已恢复，但启动世界失败: %w", startErr)
+	}
+	log.Println("存档恢复完成，恢复前备份:", safetyName)
+	return nil
 }
 
-func (b *BackupService) RestoreBackup(ctx *gin.Context, backupName string) {
-
-	clusterName := context.GetClusterName(ctx)
+func (b *BackupService) CreateBackup(clusterName, backupName string) error {
 	config, err := b.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
-	}
-
-	filePath := filepath.Join(config.Backup, backupName)
-	clusterPath := filepath.Join(b.archive.ClusterPath(clusterName))
-	err = fileUtils.DeleteDir(clusterPath)
-	if err != nil {
-		log.Panicln("删除失败,", clusterPath, err)
-	}
-	log.Println("正在恢复存档", filePath, filepath.Join(b.archive.KleiBasePath(clusterName)))
-
-	// err = zip.Unzip2(filePath, filepath.Join(constant.HOME_PATH, ".klei/DoNotStarveTogether"), cluster.ClusterName)
-	err = zip.Unzip3(filePath, clusterPath)
-	if err != nil {
-		log.Panicln("解压失败,", filePath, clusterPath, err)
-	}
-	// 安装mod
-	modoverride, err := fileUtils.ReadFile(b.archive.ModoverridesPath(clusterName, "Master"))
-	if err != nil {
-		log.Println("读取模组失败", err)
-	}
-	config, err = b.dstConfig.GetDstConfig(clusterName)
-	if err != nil {
-		log.Println(err.Error())
-	}
-	err = dstUtils.DedicatedServerModsSetup(config, modoverride)
-	if err != nil {
-		log.Println(err.Error())
-	}
-}
-
-func (b *BackupService) CreateBackup(clusterName, backupName string) {
-
-	config, err := b.dstConfig.GetDstConfig(clusterName)
-	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
+		return fmt.Errorf("读取配置失败: %w", err)
 	}
 	backupPath := config.Backup
-
-	// 执行 CSave 命令
-	err = b.gameProcess.Command(clusterName, "Master", "c_save()")
-	if err != nil {
-		log.Println("CSave command error:", err)
+	if !fileUtils.Exists(backupPath) {
+		return fmt.Errorf("备份目录不存在: %s", backupPath)
 	}
 
+	// 执行 CSave 命令
+	if cmdErr := b.gameProcess.Command(clusterName, "Master", "c_save()"); cmdErr != nil {
+		log.Println("CSave command error:", cmdErr)
+	}
 	// 等待保存完成
 	time.Sleep(2 * time.Second)
 
 	src := b.archive.ClusterPath(clusterName)
-	if !fileUtils.Exists(backupPath) {
-		log.Panicln("backup path is not exists")
-	}
 	if backupName == "" {
 		backupName = b.GenGameBackUpName(clusterName)
 	}
-	dst := filepath.Join(backupPath, backupName)
-	log.Println("src", src, dst)
-	err = zip.Zip(src, dst)
+	target, err := safeBackupPath(backupPath, backupName, false)
 	if err != nil {
-		log.Panicln("create backup error", err)
+		return err
 	}
-	log.Println("创建备份成功")
+	if fileUtils.Exists(target) {
+		return fmt.Errorf("备份文件已存在: %s", backupName)
+	}
+	if zipErr := zip.Zip(src, target); zipErr != nil {
+		return fmt.Errorf("创建备份失败: %w", zipErr)
+	}
+	log.Println("创建备份成功:", backupName)
+	return nil
 }
 
-func (b *BackupService) DownloadBackup(c *gin.Context) {
-	fileName := c.Query("fileName")
-
-	clusterName := c.GetHeader("level")
+// UploadBackup 保存上传的备份文件（校验文件名与扩展名）。
+func (b *BackupService) UploadBackup(ctx *gin.Context, clusterName string) error {
+	file, err := ctx.FormFile("file")
+	if err != nil {
+		return fmt.Errorf("读取上传文件失败: %w", err)
+	}
 	config, err := b.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
+		return fmt.Errorf("读取配置失败: %w", err)
 	}
-
-	filePath := filepath.Join(config.Backup, fileName)
-	//打开文件
-	_, err = os.Open(filePath)
-	//非空处理
+	target, err := safeBackupPath(config.Backup, file.Filename, false)
 	if err != nil {
-		log.Panicln("download filePath error", err)
+		return err
 	}
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", "attachment; filename="+fileName)
-	c.Header("Content-Transfer-Encoding", "binary")
-	// c.Header("Content-Length", strconv.FormatInt(f.Size(), 10))
-	c.File(filePath)
+	if fileUtils.Exists(target) {
+		return fmt.Errorf("备份文件已存在: %s", file.Filename)
+	}
+	if err := ctx.SaveUploadedFile(file, target); err != nil {
+		return fmt.Errorf("保存上传文件失败: %w", err)
+	}
+	return nil
 }
 
-func (b *BackupService) UploadBackup(c *gin.Context) {
-	// 单文件
-	file, _ := c.FormFile("file")
-	log.Println(file.Filename)
-
-	clusterName := context.GetClusterName(c)
-	config, err := b.dstConfig.GetDstConfig(clusterName)
+// safeBackupPath 校验备份文件名并返回备份目录内的完整路径。
+// 只允许 basename、只允许 .zip/.tar，且必须位于备份目录内。
+func safeBackupPath(backupDir, fileName string, mustExist bool) (string, error) {
+	fileName = strings.TrimSpace(fileName)
+	if fileName == "" {
+		return "", errors.New("备份文件名不能为空")
+	}
+	if fileName == "." || fileName == ".." || filepath.Base(fileName) != fileName || strings.ContainsAny(fileName, `/\`) {
+		return "", fmt.Errorf("非法备份文件名: %s", fileName)
+	}
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if ext != ".zip" && ext != ".tar" {
+		return "", fmt.Errorf("不支持的备份文件类型: %s", fileName)
+	}
+	absDir, err := filepath.Abs(backupDir)
 	if err != nil {
-		log.Println("failed to get dst config:", err)
-		return
+		return "", fmt.Errorf("备份目录无效: %w", err)
 	}
-	dst := filepath.Join(config.Backup, file.Filename)
-
-	if fileUtils.Exists(dst) {
-		log.Panicln("backup is existed")
-	}
-
-	// 上传文件至指定的完整文件路径
-	err = c.SaveUploadedFile(file, dst)
+	fullPath, err := filepath.Abs(filepath.Join(absDir, fileName))
 	if err != nil {
-		return
+		return "", fmt.Errorf("备份文件路径无效: %w", err)
 	}
-
-	// c.String(http.StatusOK, fmt.Sprintf("'%s' uploaded!", file.Filename))
-
+	rel, err := filepath.Rel(absDir, fullPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("备份文件路径越界: %s", fileName)
+	}
+	if mustExist && !fileUtils.Exists(fullPath) {
+		return "", fmt.Errorf("备份文件不存在: %s", fileName)
+	}
+	return fullPath, nil
 }
 
 func (b *BackupService) ScheduleBackupSnapshots() {

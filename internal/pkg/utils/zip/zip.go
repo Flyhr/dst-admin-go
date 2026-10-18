@@ -3,12 +3,30 @@ package zip
 import (
 	"archive/zip"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// ensureWithin 防止 zip-slip：解压目标必须位于 baseDir 内。
+func ensureWithin(baseDir, target string) error {
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(absBase, absTarget)
+	if err != nil || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("压缩包内路径越界: %s", target)
+	}
+	return nil
+}
 
 func zipDir(dirPath string, zipWriter *zip.Writer, basePath string) error {
 	fileInfos, err := os.ReadDir(dirPath)
@@ -79,6 +97,9 @@ func Unzip(zipFile, destDir string) error {
 
 	for _, file := range reader.File {
 		path := filepath.Join(destDir, file.Name)
+		if err := ensureWithin(destDir, path); err != nil {
+			return err
+		}
 
 		if file.FileInfo().IsDir() {
 			err = os.MkdirAll(path, os.ModePerm)
@@ -144,6 +165,9 @@ func Unzip3(source, destination string) error {
 		relativePath = strings.TrimPrefix(relativePath, "\\")
 
 		extractedFilePath := filepath.Join(destination, relativePath)
+		if err := ensureWithin(destination, extractedFilePath); err != nil {
+			return err
+		}
 		log.Println("extractedFilePath", extractedFilePath)
 		if file.FileInfo().IsDir() {
 			os.MkdirAll(extractedFilePath, os.ModePerm)
@@ -238,6 +262,9 @@ func Unzip2(zipFile, destDir, newName string) error {
 		}
 
 		log.Println(">>> ", f.Name, extractedFilePath)
+		if err := ensureWithin(destDir, extractedFilePath); err != nil {
+			return err
+		}
 		if f.FileInfo().IsDir() {
 			// 创建目录
 			os.MkdirAll(extractedFilePath, os.ModePerm)
