@@ -14,6 +14,8 @@ import (
 
 type Update interface {
 	Update(clusterName string) error
+	// Repair 使用 SteamCMD validate 对游戏本体做全量校验/修复（文件损坏时手动触发）。
+	Repair(clusterName string) error
 }
 
 // updateMutex 保证同一时间只有一个更新任务（手动/定时/重启流程）在运行 SteamCMD。
@@ -38,7 +40,7 @@ func EscapePath(path string) string {
 	return path
 }
 
-func GetBaseUpdateCmd(cluster dstConfig.DstConfig) string {
+func GetBaseUpdateCmd(cluster dstConfig.DstConfig, deep bool) string {
 	steamCmdPath := cluster.Steamcmd
 	dstInstallDir := cluster.Force_install_dir
 	if cluster.Beta == 1 {
@@ -50,28 +52,32 @@ func GetBaseUpdateCmd(cluster dstConfig.DstConfig) string {
 
 	// 构建基本命令：
 	// - 使用 app_info_update 刷新元数据，避免 app_update 使用过期的应用信息；
-	// - 不再默认加 validate：全量校验耗时长，还可能覆盖面板维护的 mods 配置。
+	// - 普通更新不加 validate（更快，也不会覆盖面板维护的 mods 配置）；
+	// - 深度修复（deep=true）追加 validate，做全量文件校验/修复。
 	baseCmd := "+login anonymous +force_install_dir %s +app_info_update 1 +app_update 343050"
 	if cluster.Beta == 1 {
 		baseCmd += " -beta updatebeta"
+	}
+	if deep {
+		baseCmd += " validate"
 	}
 	baseCmd += " +quit"
 	baseCmd = fmt.Sprintf(baseCmd, dstInstallDir)
 	return baseCmd
 }
 
-func WindowUpdateCommand(cluster dstConfig.DstConfig) (string, error) {
+func WindowUpdateCommand(cluster dstConfig.DstConfig, deep bool) (string, error) {
 	steamCmdPath := cluster.Steamcmd
-	baseCmd := GetBaseUpdateCmd(cluster)
+	baseCmd := GetBaseUpdateCmd(cluster, deep)
 
 	var cmd string
 	cmd = fmt.Sprintf("cd /d %s && Start steamcmd.exe %s", steamCmdPath, baseCmd)
 	return cmd, nil
 }
 
-func LinuxUpdateCommand(cluster dstConfig.DstConfig) (string, error) {
+func LinuxUpdateCommand(cluster dstConfig.DstConfig, deep bool) (string, error) {
 	steamCmdPath := cluster.Steamcmd
-	baseCmd := GetBaseUpdateCmd(cluster)
+	baseCmd := GetBaseUpdateCmd(cluster, deep)
 	var cmd string
 	steamCmdScript := filepath.Join(steamCmdPath, "steamcmd.sh")
 	if cluster.Bin == 86 {

@@ -19,6 +19,14 @@ func NewLinuxUpdate(dstConfig dstConfig.Config) *LinuxUpdate {
 }
 
 func (u LinuxUpdate) Update(clusterName string) error {
+	return u.run(clusterName, false)
+}
+
+func (u LinuxUpdate) Repair(clusterName string) error {
+	return u.run(clusterName, true)
+}
+
+func (u LinuxUpdate) run(clusterName string, deep bool) error {
 	unlock, err := beginUpdate()
 	if err != nil {
 		return err
@@ -29,7 +37,7 @@ func (u LinuxUpdate) Update(clusterName string) error {
 	if err != nil {
 		return err
 	}
-	updateCommand, err := LinuxUpdateCommand(config)
+	updateCommand, err := LinuxUpdateCommand(config, deep)
 	if err != nil {
 		return err
 	}
@@ -41,13 +49,17 @@ func (u LinuxUpdate) Update(clusterName string) error {
 	setupPath, setupContent, setupHad := captureModsSetupFile(dstInstallDir)
 	defer restoreModsSetupFile(setupPath, setupContent, setupHad)
 
-	log.Println("正在更新游戏", "cluster: ", clusterName, "command: ", updateCommand)
+	action := "更新游戏"
+	if deep {
+		action = "深度修复游戏"
+	}
+	log.Println("正在"+action, "cluster: ", clusterName, "command: ", updateCommand)
 	_, err = shellUtils.Shell(updateCommand)
 	if err == nil {
 		return nil
 	}
 
-	log.Println("更新游戏失败，清理 Steam 下载缓存后重试一次", "cluster: ", clusterName, "error: ", err)
+	log.Println(action+"失败，清理 Steam 下载缓存后重试一次", "cluster: ", clusterName, "error: ", err)
 	cleanupSteamDownloadCache(config)
 	_, retryErr := shellUtils.Shell(updateCommand)
 	if retryErr != nil {

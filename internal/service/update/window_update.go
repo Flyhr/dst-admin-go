@@ -17,6 +17,14 @@ func NewWindowUpdate(dstConfig dstConfig.Config) *WindowUpdate {
 }
 
 func (u WindowUpdate) Update(clusterName string) error {
+	return u.run(clusterName, false)
+}
+
+func (u WindowUpdate) Repair(clusterName string) error {
+	return u.run(clusterName, true)
+}
+
+func (u WindowUpdate) run(clusterName string, deep bool) error {
 	unlock, err := beginUpdate()
 	if err != nil {
 		return err
@@ -27,7 +35,7 @@ func (u WindowUpdate) Update(clusterName string) error {
 	if err != nil {
 		return err
 	}
-	updateCommand, err := WindowUpdateCommand(config)
+	updateCommand, err := WindowUpdateCommand(config, deep)
 	if err != nil {
 		return err
 	}
@@ -39,7 +47,11 @@ func (u WindowUpdate) Update(clusterName string) error {
 	setupPath, setupContent, setupHad := captureModsSetupFile(dstInstallDir)
 	defer restoreModsSetupFile(setupPath, setupContent, setupHad)
 
-	log.Println("正在更新游戏", "cluster: ", clusterName, "command: ", updateCommand)
+	action := "更新游戏"
+	if deep {
+		action = "深度修复游戏"
+	}
+	log.Println("正在"+action, "cluster: ", clusterName, "command: ", updateCommand)
 	result, err := shellUtils.ExecuteCommandInWin(updateCommand)
 	log.Println(result)
 	return err
