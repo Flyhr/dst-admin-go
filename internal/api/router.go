@@ -106,7 +106,7 @@ func Register(cfg *config.Config, db *gorm.DB, router *gin.RouterGroup) {
 	playerService := player.NewPlayerService(resolverService)
 	gameArchiveService := gameArchive.NewGameArchive(gameConfigService, levelService, resolverService)
 	modService := mod.NewModService(db, dstConfigService, resolverService)
-	scheduleService := schedule.NewScheduleService(db, gameProcess, backupService, updateService, dstConfigService)
+	scheduleService := schedule.NewScheduleService(db, gameProcess, backupService, updateService, dstConfigService, resolverService, modService)
 
 	dstMapGenerator := dstMap.NewDSTMapGenerator()
 
@@ -116,7 +116,7 @@ func Register(cfg *config.Config, db *gorm.DB, router *gin.RouterGroup) {
 	resolverService.StartDailyVersionCheck()
 
 	//  handler
-	updateHandler := handler.NewUpdateHandler(updateService, resolverService, gameProcess, levelConfigUtils)
+	updateHandler := handler.NewUpdateHandler(updateService, resolverService, gameProcess, levelConfigUtils, modService)
 	gameHandler := handler.NewGameHandler(gameProcess, levelService, gameArchiveService, levelConfigUtils, resolverService, modService)
 	gameConfigHandler := handler.NewGameConfigHandler(gameConfigService)
 	dstConfigHandler := handler.NewDstConfigHandler(dstConfigService, resolverService)

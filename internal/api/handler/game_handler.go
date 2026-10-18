@@ -11,6 +11,7 @@ import (
 	"dst-admin-go/internal/service/gameArchive"
 	"dst-admin-go/internal/service/level"
 	"dst-admin-go/internal/service/levelConfig"
+	"dst-admin-go/internal/service/maintenance"
 	"dst-admin-go/internal/service/mod"
 	"encoding/json"
 	"log"
@@ -89,6 +90,13 @@ func (p *GameHandler) Stop(ctx *gin.Context) {
 // @Success 200 {object} response.Response
 // @Router /api/game/start [get]
 func (p *GameHandler) Start(ctx *gin.Context) {
+	if snapshot := maintenance.Current(); snapshot.Active {
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: 409,
+			Msg:  snapshot.Kind + "正在进行，暂不能启动世界，请稍后再试",
+		})
+		return
+	}
 	clusterName := context.GetClusterName(ctx)
 	levelName := ctx.Query("levelName")
 	if levelName == "" {
@@ -128,6 +136,13 @@ func (p *GameHandler) Start(ctx *gin.Context) {
 // @Success 200 {object} response.Response
 // @Router /api/game/start/all [get]
 func (p *GameHandler) StartAll(ctx *gin.Context) {
+	if snapshot := maintenance.Current(); snapshot.Active {
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: 409,
+			Msg:  snapshot.Kind + "正在进行，暂不能启动世界，请稍后再试",
+		})
+		return
+	}
 	clusterName := context.GetClusterName(ctx)
 	// 启动前先停世界并清理失效 UGC 记录，避免残留 ACF 记录导致 Workshop 更新整体失败。
 	if p.modService != nil {

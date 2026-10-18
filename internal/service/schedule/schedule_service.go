@@ -2,9 +2,11 @@ package schedule
 
 import (
 	"dst-admin-go/internal/model"
+	"dst-admin-go/internal/service/archive"
 	"dst-admin-go/internal/service/backup"
 	"dst-admin-go/internal/service/dstConfig"
 	"dst-admin-go/internal/service/game"
+	"dst-admin-go/internal/service/mod"
 	"dst-admin-go/internal/service/update"
 	"log"
 	"strings"
@@ -29,8 +31,11 @@ func NewScheduleService(
 	backupService *backup.BackupService,
 	updateService update.Update,
 	dstConfigService dstConfig.Config,
+	resolver *archive.PathResolver,
+	modService *mod.ModService,
 ) *ScheduleService {
-	c := cron.New()
+	// 同一任务上一次还没跑完时跳过本次触发，避免“更新游戏”等长任务重叠执行。
+	c := cron.New(cron.WithChain(cron.SkipIfStillRunning(cron.DefaultLogger)))
 
 	// 创建策略上下文
 	strategyContext := &StrategyContext{
@@ -38,6 +43,8 @@ func NewScheduleService(
 		BackupService: backupService,
 		UpdateService: updateService,
 		DstConfig:     dstConfigService,
+		Archive:       resolver,
+		ModService:    modService,
 	}
 
 	service := &ScheduleService{

@@ -6,6 +6,8 @@ import (
 	"dst-admin-go/internal/service/archive"
 	"dst-admin-go/internal/service/game"
 	"dst-admin-go/internal/service/levelConfig"
+	"dst-admin-go/internal/service/maintenance"
+	"dst-admin-go/internal/service/mod"
 	"dst-admin-go/internal/service/update"
 	"fmt"
 	"log"
@@ -15,11 +17,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	// updateBusyCode 表示已有更新/修复任务在执行（与“执行失败”区分，调用方不能据此重启世界）。
+	updateBusyCode = 409
+)
+
 type UpdateHandler struct {
 	updateService    update.Update
 	resolver         *archive.PathResolver
 	gameProcess      game.Process
 	levelConfigUtils *levelConfig.LevelConfigUtils
+	modService       *mod.ModService
 }
 
 func NewUpdateHandler(
@@ -27,12 +35,14 @@ func NewUpdateHandler(
 	resolver *archive.PathResolver,
 	gameProcess game.Process,
 	levelConfigUtils *levelConfig.LevelConfigUtils,
+	modService *mod.ModService,
 ) *UpdateHandler {
 	return &UpdateHandler{
 		updateService:    update,
 		resolver:         resolver,
 		gameProcess:      gameProcess,
 		levelConfigUtils: levelConfigUtils,
+		modService:       modService,
 	}
 }
 
@@ -40,6 +50,7 @@ func (h *UpdateHandler) RegisterRoute(router *gin.RouterGroup) {
 	router.GET("/api/game/update", h.Update)
 	router.GET("/api/game/repair", h.Repair)
 	router.GET("/api/game/version", h.Version)
+	router.GET("/api/game/update/status", h.Status)
 }
 
 // Update 更新游戏。
@@ -90,6 +101,7 @@ func (h *UpdateHandler) Version(ctx *gin.Context) {
 	data := map[string]interface{}{
 		"lastVersion":      info.Version,
 		"versionCheckedAt": info.CheckedAt,
+		"versionSource":    info.Source,
 	}
 	if localErr == nil {
 		data["version"] = localBuildID
@@ -104,6 +116,33 @@ func (h *UpdateHandler) Version(ctx *gin.Context) {
 	})
 }
 
+// Status 查询当前是否有更新/修复任务在执行，以及上一次执行结果。
+// GET /api/game/update/status
+func (h *UpdateHandler) Status(ctx *gin.Context) {
+	clusterName := context.GetClusterName(ctx)
+	snapshot := maintenance.Current()
+	data := map[string]interface{}{
+		"updating":       snapshot.Active,
+		"kind":           snapshot.Kind,
+		"startedAt":      snapshot.StartedAt,
+		"lastFinishedAt": snapshot.LastFinishedAt,
+		"lastSuccess":    snapshot.LastSuccess,
+		"lastRestarted":  snapshot.LastRestarted,
+	}
+	if buildID, err := h.resolver.GetLocalDstBuildId(clusterName); err == nil {
+		data["version"] = buildID
+	}
+	ctx.JSON(http.StatusOK, response.Response{
+		Code: 200,
+		Msg:  "get update status success",
+		Data: data,
+	})
+}
+
+// run 执行一次更新/修复。
+//
+// 流程在服务端完成：维护锁 → 停服 → 更新/修复 → 核验 buildid → 成功后启动世界。
+// 失败时不启动世界：SteamCMD 失败可能留下不完整文件，启动世界反而扩大风险。
 func (h *UpdateHandler) run(ctx *gin.Context, deep bool) {
 	clusterName := context.GetClusterName(ctx)
 	action := "更新游戏"
@@ -111,57 +150,172 @@ func (h *UpdateHandler) run(ctx *gin.Context, deep bool) {
 		action = "深度修复游戏"
 	}
 
-	// 后端强制校验世界已停止：无论从页面、定时任务还是直接调接口，都不允许在游戏运行时改文件。
+	if !maintenance.TryBegin(action) {
+		log.Println(action + "被拒绝：已有更新/修复任务正在执行")
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: updateBusyCode,
+			Msg:  "已有更新/修复任务正在执行，请稍后再试",
+		})
+		return
+	}
+
+	success := false
+	restarted := false
+	defer func() {
+		maintenance.Finish(success, restarted)
+	}()
+
+	// 1. 服务端统一停服：不再依赖前端先调用停服接口。
+	if h.gameProcess != nil {
+		if stopErr := h.gameProcess.StopAll(clusterName); stopErr != nil {
+			log.Println(action+"已取消：停止世界失败: ", stopErr)
+			ctx.JSON(http.StatusOK, response.Response{
+				Code: 500,
+				Msg:  action + "已取消：停止世界失败: " + stopErr.Error() + "；请检查世界状态后手动启动",
+			})
+			return
+		}
+	}
+
+	// 2. 复核对所有分片确实已停止，避免在游戏运行时改文件。
 	if err := h.ensureWorldsStopped(clusterName); err != nil {
-		log.Println(action+"被拒绝:", err)
-		ctx.JSON(http.StatusOK, response.Response{Code: 500, Msg: err.Error()})
+		log.Println(action+"已取消: ", err)
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: 500,
+			Msg:  action + "已取消: " + err.Error() + "；世界保持停止状态",
+		})
 		return
 	}
 
 	beforeBuildID, _ := h.resolver.GetLocalDstBuildId(clusterName)
 
-	var err error
+	var updateErr error
 	if deep {
-		err = h.updateService.Repair(clusterName)
+		updateErr = h.updateService.Repair(clusterName)
 	} else {
-		err = h.updateService.Update(clusterName)
+		updateErr = h.updateService.Update(clusterName)
 	}
-	if err != nil {
-		log.Println(action+"失败:", err)
+
+	// 更新/修复无论成功与否都可能改动过本地文件，清空版本缓存让下一次检查重新取数。
+	h.resolver.InvalidateVersionCache(clusterName)
+
+	if updateErr != nil {
+		log.Println(action+"失败: ", updateErr)
 		ctx.JSON(http.StatusOK, response.Response{
 			Code: 500,
-			Msg:  actionErrorMessage(action, err),
-			Data: nil,
+			Msg:  actionErrorMessage(action, updateErr) + "；世界保持停止状态，请先检查游戏版本再手动启动",
+			Data: map[string]interface{}{
+				"buildId":       beforeBuildID,
+				"beforeBuildId": beforeBuildID,
+				"restarted":     false,
+			},
 		})
 		return
 	}
 
-	// 更新/修复后核验：读取本地 buildid，确认安装记录可用（不能只看 SteamCMD 退出码）。
+	// 3. 核验 buildid：不能只看 SteamCMD 退出码。
 	buildID, verifyErr := h.resolver.GetLocalDstBuildId(clusterName)
 	if verifyErr != nil {
 		log.Println(action + "后读取本地 buildid 失败: " + verifyErr.Error())
 		ctx.JSON(http.StatusOK, response.Response{
 			Code: 500,
-			Msg:  action + "命令已执行，但无法读取本地 buildid 进行核验: " + verifyErr.Error(),
-			Data: nil,
+			Msg:  action + "命令已执行，但无法读取本地 buildid 进行核验: " + verifyErr.Error() + "；世界保持停止状态，请检查后手动启动",
+			Data: map[string]interface{}{
+				"buildId":       beforeBuildID,
+				"beforeBuildId": beforeBuildID,
+				"restarted":     false,
+			},
 		})
 		return
 	}
-	// 更新完成后清空版本缓存，页面下一次检查会重新获取真实数据。
-	h.resolver.InvalidateVersionCache(clusterName)
-
-	msg := "update dst success"
-	if deep {
-		msg = "repair dst success"
+	if verifyBuildErr := h.verifyUpdatedBuildID(clusterName, deep, beforeBuildID, buildID); verifyBuildErr != nil {
+		log.Println(action + "后 buildid 核验失败: " + verifyBuildErr.Error())
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: 500,
+			Msg:  action + "后 buildid 核验失败: " + verifyBuildErr.Error() + "；世界保持停止状态，请检查游戏文件后手动启动",
+			Data: map[string]interface{}{
+				"buildId":       buildID,
+				"beforeBuildId": beforeBuildID,
+				"restarted":     false,
+			},
+		})
+		return
 	}
+
+	success = true
+
+	// 4. 更新/修复成功后再启动世界。
+	if h.gameProcess != nil {
+		if startErr := h.startWorlds(clusterName); startErr != nil {
+			log.Println(action + "已完成，但启动世界失败: " + startErr.Error())
+			ctx.JSON(http.StatusOK, response.Response{
+				Code: 500,
+				Msg:  action + "已完成（buildid " + fmt.Sprintf("%d", buildID) + "），但启动世界失败: " + startErr.Error() + "；请手动启动世界",
+				Data: map[string]interface{}{
+					"buildId":       buildID,
+					"beforeBuildId": beforeBuildID,
+					"restarted":     false,
+				},
+			})
+			return
+		}
+		restarted = true
+	}
+
 	ctx.JSON(http.StatusOK, response.Response{
 		Code: 200,
-		Msg:  msg,
+		Msg:  action + "成功，世界已重新启动",
 		Data: map[string]interface{}{
 			"buildId":       buildID,
 			"beforeBuildId": beforeBuildID,
+			"restarted":     restarted,
 		},
 	})
+}
+
+// startWorlds 按既有页面逻辑启动所有世界：先清理失效 UGC 记录，再启动并登记模组安装状态。
+func (h *UpdateHandler) startWorlds(clusterName string) error {
+	if h.modService != nil {
+		if repairErr := h.modService.RepairStaleUgcRecords(clusterName); repairErr != nil {
+			log.Println("清理失效 UGC 记录失败:", repairErr)
+		}
+	}
+	if err := h.gameProcess.StartAll(clusterName); err != nil {
+		return err
+	}
+	if h.modService != nil {
+		if trackErr := h.modService.BeginInstallTracking(clusterName); trackErr != nil {
+			log.Println("登记模组安装状态失败:", trackErr)
+		}
+	}
+	return nil
+}
+
+// verifyUpdatedBuildID 核验更新后的 buildid。
+//   - 普通更新要求 buildid 不下降；
+//   - 若 buildid 没变化，则与已知最新 buildid 比较，避免 SteamCMD 退出码 0 但实际未更新；
+//   - 深度修复只要求能读取到有效 buildid（修复不必然改变版本）。
+func (h *UpdateHandler) verifyUpdatedBuildID(clusterName string, deep bool, before, after int64) error {
+	if after <= 0 {
+		return fmt.Errorf("buildid 无效: %d", after)
+	}
+	if deep {
+		return nil
+	}
+	if before > 0 && after < before {
+		return fmt.Errorf("更新后 buildid %d 低于更新前 %d", after, before)
+	}
+	if before > 0 && after == before {
+		latest, err := h.resolver.GetLatestDstVersionInfo(clusterName)
+		if err != nil {
+			log.Printf("无法确认最新版本，跳过 buildid 变化校验: %v", err)
+			return nil
+		}
+		if latest.Version > after {
+			return fmt.Errorf("SteamCMD 返回成功，但本地 buildid 仍为 %d（最新为 %d），更新可能未生效", after, latest.Version)
+		}
+	}
+	return nil
 }
 
 // ensureWorldsStopped 检查所有分片是否已停止；任何分片仍在运行都拒绝更新/修复。
