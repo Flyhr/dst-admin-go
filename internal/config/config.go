@@ -41,14 +41,17 @@ const (
 var Cfg *Config
 
 func Load() *Config {
+	// 先初始化默认配置：config.yml 缺失或为空时也要能启动，而不是对 nil 解引用 panic。
+	c := &Config{}
 	yamlFile, err := ioutil.ReadFile(DefaultConfigPath)
 	if err != nil {
 		fmt.Println(err.Error())
 	}
-	var c *Config
-	err = yaml.Unmarshal(yamlFile, &c)
-	if err != nil {
-		fmt.Println(err.Error())
+	if len(yamlFile) > 0 {
+		if err = yaml.Unmarshal(yamlFile, c); err != nil {
+			fmt.Println(err.Error())
+			c = &Config{}
+		}
 	}
 	if c.Port == "" {
 		c.Port = DefaultPort
