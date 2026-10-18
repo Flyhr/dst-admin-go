@@ -235,11 +235,31 @@ func (p *LinuxProcess) Status(clusterName, levelName string) (bool, error) {
 
 func matchesGameProcess(line, clusterName, levelName string) bool {
 	fields := strings.Fields(line)
-	if len(fields) < 2 || !strings.HasPrefix(filepath.Base(fields[1]), "dontstarve_dedicated_server_nullrenderer") {
+	if len(fields) < 2 {
 		return false
 	}
+	// 启动命令可能是 `./dontstarve...`、`box86 ./dontstarve...`、`box64 ...`：
+	// 可执行文件名不一定在第二个字段，因此先定位它。
+	execIndex := -1
+	for i := 1; i < len(fields); i++ {
+		if strings.HasPrefix(filepath.Base(fields[i]), "dontstarve_dedicated_server_nullrenderer") {
+			execIndex = i
+			break
+		}
+	}
+	if execIndex == -1 {
+		return false
+	}
+	// 游戏进程只能直接启动，或由 box86/box64 唤起；
+	// tmux/screen/bash 等包装进程的命令行里即使出现游戏路径，也不应当作游戏进程。
+	for i := 1; i < execIndex; i++ {
+		base := filepath.Base(fields[i])
+		if !strings.HasPrefix(base, "box86") && !strings.HasPrefix(base, "box64") {
+			return false
+		}
+	}
 	cluster, shard := "", ""
-	for i := 2; i+1 < len(fields); i++ {
+	for i := 1; i+1 < len(fields); i++ {
 		switch fields[i] {
 		case "-cluster":
 			cluster = fields[i+1]
