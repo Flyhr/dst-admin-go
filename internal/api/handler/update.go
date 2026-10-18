@@ -3,6 +3,7 @@ package handler
 import (
 	"dst-admin-go/internal/pkg/context"
 	"dst-admin-go/internal/pkg/response"
+	"dst-admin-go/internal/service/archive"
 	"dst-admin-go/internal/service/update"
 	"log"
 	"net/http"
@@ -13,11 +14,13 @@ import (
 
 type UpdateHandler struct {
 	updateService update.Update
+	resolver      *archive.PathResolver
 }
 
-func NewUpdateHandler(update update.Update) *UpdateHandler {
+func NewUpdateHandler(update update.Update, resolver *archive.PathResolver) *UpdateHandler {
 	return &UpdateHandler{
 		updateService: update,
+		resolver:      resolver,
 	}
 }
 
@@ -46,10 +49,22 @@ func (h *UpdateHandler) Update(ctx *gin.Context) {
 		return
 	}
 
+	// 更新后核验：读取本地 buildid，确认安装记录可用（不能只看 SteamCMD 退出码）。
+	buildID, verifyErr := h.resolver.GetLocalDstBuildId(clusterName)
+	if verifyErr != nil {
+		log.Println("更新后读取本地 buildid 失败:", verifyErr)
+		ctx.JSON(http.StatusOK, response.Response{
+			Code: 500,
+			Msg:  "更新命令已执行，但无法读取本地 buildid 进行核验: " + verifyErr.Error(),
+			Data: nil,
+		})
+		return
+	}
+
 	ctx.JSON(http.StatusOK, response.Response{
 		Code: 200,
 		Msg:  "update dst success",
-		Data: nil,
+		Data: map[string]interface{}{"buildId": buildID},
 	})
 }
 

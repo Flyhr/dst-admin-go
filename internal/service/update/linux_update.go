@@ -19,6 +19,12 @@ func NewLinuxUpdate(dstConfig dstConfig.Config) *LinuxUpdate {
 }
 
 func (u LinuxUpdate) Update(clusterName string) error {
+	unlock, err := beginUpdate()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	config, err := u.dstConfig.GetDstConfig(clusterName)
 	if err != nil {
 		return err
@@ -27,6 +33,14 @@ func (u LinuxUpdate) Update(clusterName string) error {
 	if err != nil {
 		return err
 	}
+
+	dstInstallDir := config.Force_install_dir
+	if config.Beta == 1 {
+		dstInstallDir = dstInstallDir + "-beta"
+	}
+	setupPath, setupContent, setupHad := captureModsSetupFile(dstInstallDir)
+	defer restoreModsSetupFile(setupPath, setupContent, setupHad)
+
 	log.Println("正在更新游戏", "cluster: ", clusterName, "command: ", updateCommand)
 	_, err = shellUtils.Shell(updateCommand)
 	if err == nil {
@@ -42,6 +56,7 @@ func (u LinuxUpdate) Update(clusterName string) error {
 	return nil
 }
 
+// cleanupSteamDownloadCache 清理下载中间状态，保留 appmanifest 以便更新后还能读取本地 buildid。
 func cleanupSteamDownloadCache(config dstConfig.DstConfig) {
 	dstInstallDir := config.Force_install_dir
 	if config.Beta == 1 {
@@ -50,7 +65,6 @@ func cleanupSteamDownloadCache(config dstConfig.DstConfig) {
 	paths := []string{
 		filepath.Join(dstInstallDir, "steamapps", "downloading"),
 		filepath.Join(dstInstallDir, "steamapps", "temp"),
-		filepath.Join(dstInstallDir, "steamapps", "appmanifest_343050.acf"),
 	}
 	for _, path := range paths {
 		if err := os.RemoveAll(path); err != nil {

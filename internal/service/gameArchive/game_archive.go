@@ -50,6 +50,8 @@ type GameArchiveInfo struct {
 	Meta               Meta   `json:"meta"`
 	Version            int64  `json:"version"`
 	LastVersion        int64  `json:"lastVersion"`
+	VersionSource      string `json:"versionSource"`
+	VersionCheckedAt   int64  `json:"versionCheckedAt"`
 }
 
 type Clock struct {
@@ -183,10 +185,12 @@ func (d *GameArchive) GetGameArchive(clusterName string) GameArchiveInfo {
 			}
 		}()
 		localVersion, _ := d.archive.GetLocalDstBuildId(clusterName)
-		version, _ := d.archive.GetLastDstVersion(clusterName)
+		versionInfo, _ := d.archive.GetLatestDstVersionInfo(clusterName)
 
 		gameArchie.Version = localVersion
-		gameArchie.LastVersion = version
+		gameArchie.LastVersion = versionInfo.Version
+		gameArchie.VersionSource = versionInfo.Source
+		gameArchie.VersionCheckedAt = versionInfo.CheckedAt
 	}()
 
 	wg.Wait()

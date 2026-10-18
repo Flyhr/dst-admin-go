@@ -2,84 +2,123 @@ package archive
 
 import (
 	"context"
-	"dst-admin-go/internal/config"
-	"dst-admin-go/internal/pkg/utils/fileUtils"
-	"dst-admin-go/internal/service/dstConfig"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"dst-admin-go/internal/pkg/utils/fileUtils"
+	"dst-admin-go/internal/service/dstConfig"
 )
 
 const (
 	steamCmdAppID = "343050"
 
-	// 最新版本结果缓存时间：避免每次刷新面板都运行一次 SteamCMD。
-	dstVersionCacheTTL     = 5 * time.Minute
+	// 快速查询（第三方）缓存时间：用于页面快速展示。
+	quickVersionCacheTTL = 5 * time.Minute
+	// SteamCMD 权威校验有效期：即使快速查询一直可用，也至少每天用 SteamCMD 校验一次。
+	steamCmdValidateTTL = 24 * time.Hour
+	// SteamCMD 查询超时。
 	steamCmdVersionTimeout = 25 * time.Second
-	steamAPIVersionTimeout = 8 * time.Second
+	// 快速接口超时。
+	quickVersionTimeout = 6 * time.Second
+	// SteamCMD 校验结果的短期复用时间，避免同一时刻重复执行。
+	steamCmdResultMinAge = 10 * time.Second
 )
+
+const (
+	quickVersionURL = "https://api.steamcmd.net/v1/info/" + steamCmdAppID
+
+	versionSourceQuick       = "quick"       // 第三方快速接口（仅用于展示/预判）
+	versionSourceSteamCmd    = "steamcmd"    // 刚刚用本机 SteamCMD 校验过
+	versionSourceCache       = "cache"       // 使用 24h 内的 SteamCMD 校验缓存
+	versionSourceStaleCache  = "stale-cache" // SteamCMD 暂时不可用时的过期缓存
+	versionSourceUnavailable = "unavailable"
+)
+
+// LatestDstVersionInfo 最新版本查询结果，附带来源与最近一次 SteamCMD 校验时间。
+type LatestDstVersionInfo struct {
+	Version   int64
+	Source    string
+	CheckedAt int64
+}
 
 type dstVersionCacheEntry struct {
 	version int64
 	at      time.Time
 }
 
-// GetLastDstVersion 查询最新 DST 专用服务器 buildid。
-// 依次尝试：Steam Web API（配置了 steamAPIKey 时）→ SteamCMD app_info_print（匿名）
-// → 配置的 dstVersionUrl（旧版第三方地址，作为兜底）。
-func (r *PathResolver) getLastDstVersion(clusterName string) (int64, error) {
-	dstCfg, err := r.dstConfig.GetDstConfig(clusterName)
+// GetLastDstVersion 兼容旧调用：只返回最新 buildid。
+func (r *PathResolver) GetLastDstVersion(clusterName string) (int64, error) {
+	info, err := r.GetLatestDstVersionInfo(clusterName)
 	if err != nil {
 		return -1, err
 	}
+	return info.Version, nil
+}
+
+// GetLatestDstVersionInfo 查询最新 DST 专用服务器 buildid。
+//
+// 设计：
+//  1. 快速层：api.steamcmd.net（第三方、无需认证）用于快速展示，缓存 5 分钟；
+//  2. 权威层：本机 SteamCMD `app_info_print 343050`，结果缓存 24 小时，并且至少每天校验一次；
+//  3. 两者不一致时以 SteamCMD 为准；快速层失败时使用 SteamCMD 缓存或同步查询；
+//  4. 所有失败都不会被当成“已是最新”，而是返回错误/未知来源。
+func (r *PathResolver) GetLatestDstVersionInfo(clusterName string) (LatestDstVersionInfo, error) {
+	dstCfg, err := r.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return LatestDstVersionInfo{Version: -1, Source: versionSourceUnavailable}, err
+	}
 	beta := dstCfg.Beta == 1
-	if cached, ok := r.cachedLatestDstVersion(beta); ok {
-		return cached, nil
-	}
 
-	// 同一时间只允许一个查询，避免面板并发请求同时启动多个 SteamCMD。
-	r.versionFetchMu.Lock()
-	defer r.versionFetchMu.Unlock()
-	if cached, ok := r.cachedLatestDstVersion(beta); ok {
-		return cached, nil
-	}
+	quickVersion, quickOK := r.quickLatestDstVersion(beta)
+	steamVersion, steamAt, steamOK := r.cachedSteamCmdVersion(beta)
+	steamFresh := steamOK && time.Since(steamAt) < steamCmdValidateTTL
 
-	var errs []string
-	if apiKey := strings.TrimSpace(config.Cfg.SteamAPIKey); apiKey != "" {
-		localBuildID, localErr := r.GetLocalDstBuildId(clusterName)
-		if localErr == nil && localBuildID > 0 {
-			version, apiErr := r.latestDstVersionViaSteamAPI(apiKey, localBuildID)
-			if apiErr == nil && version > 0 {
-				r.cacheLatestDstVersion(beta, version)
-				log.Printf("游戏版本查询：Steam Web API 返回 buildid %d", version)
-				return version, nil
-			}
-			if apiErr != nil {
-				errs = append(errs, "Steam API: "+apiErr.Error())
-			}
-		} else if localErr != nil {
-			errs = append(errs, "读取本地 buildid 失败: "+localErr.Error())
+	// 快速检查 + SteamCMD 缓存都可用且一致：直接使用 SteamCMD 缓存（速度最快且可信）。
+	if steamFresh && quickOK && quickVersion == steamVersion {
+		return LatestDstVersionInfo{Version: steamVersion, Source: versionSourceCache, CheckedAt: steamAt.Unix()}, nil
+	}
+	// 快速检查发现与上次 SteamCMD 校验不同的版本：立即用 SteamCMD 核实，避免第三方数据错误。
+	if quickOK && steamOK && quickVersion != steamVersion {
+		if version, cmdErr := r.steamCmdVersionChecked(dstCfg, beta); cmdErr == nil {
+			log.Printf("版本检查：快速来源 %d 与 SteamCMD 缓存 %d 不一致，以 SteamCMD %d 为准", quickVersion, steamVersion, version)
+			return LatestDstVersionInfo{Version: version, Source: versionSourceSteamCmd, CheckedAt: time.Now().Unix()}, nil
 		}
 	}
-
-	if version, cmdErr := r.latestDstVersionViaSteamCmd(dstCfg); cmdErr == nil && version > 0 {
-		r.cacheLatestDstVersion(beta, version)
-		log.Printf("游戏版本查询：SteamCMD 返回 buildid %d", version)
-		return version, nil
-	} else if cmdErr != nil {
-		errs = append(errs, "SteamCMD: "+cmdErr.Error())
+	// 快速检查有结果（缓存为空或已过期）：先返回快速结果，同时异步触发 SteamCMD 每日校验。
+	if quickOK {
+		if !steamFresh {
+			r.refreshSteamCmdVersionAsync(dstCfg, beta)
+		}
+		checkedAt := int64(0)
+		if steamOK {
+			checkedAt = steamAt.Unix()
+		}
+		return LatestDstVersionInfo{Version: quickVersion, Source: versionSourceQuick, CheckedAt: checkedAt}, nil
 	}
-
-	return -1, fmt.Errorf("无法获取最新游戏 buildid: %s", strings.Join(errs, "; "))
+	// 快速检查不可用：使用未过期的 SteamCMD 缓存。
+	if steamFresh {
+		return LatestDstVersionInfo{Version: steamVersion, Source: versionSourceCache, CheckedAt: steamAt.Unix()}, nil
+	}
+	// 快速检查不可用、缓存也过期：同步执行 SteamCMD 校验。
+	if version, cmdErr := r.steamCmdVersionChecked(dstCfg, beta); cmdErr == nil {
+		return LatestDstVersionInfo{Version: version, Source: versionSourceSteamCmd, CheckedAt: time.Now().Unix()}, nil
+	} else {
+		log.Println("SteamCMD 版本校验失败:", cmdErr)
+	}
+	// 最后兜底：使用过期缓存，但标记来源为 stale-cache，避免被误判为“已是最新”。
+	if steamOK {
+		return LatestDstVersionInfo{Version: steamVersion, Source: versionSourceStaleCache, CheckedAt: steamAt.Unix()}, nil
+	}
+	return LatestDstVersionInfo{Version: -1, Source: versionSourceUnavailable}, fmt.Errorf("无法获取最新游戏 buildid")
 }
 
 // GetLocalDstBuildId 读取本机已安装的 DST 专用服务器 buildid。
@@ -116,49 +155,46 @@ func parseAppManifestBuildId(content string) (int64, error) {
 	return 0, fmt.Errorf("appmanifest 中未找到 buildid")
 }
 
-func (r *PathResolver) cachedLatestDstVersion(beta bool) (int64, bool) {
+// quickLatestDstVersion 调用第三方快速接口查询最新 buildid（缓存 5 分钟）。
+func (r *PathResolver) quickLatestDstVersion(beta bool) (int64, bool) {
+	cacheKey := boolCacheKey(beta)
 	r.versionCacheMu.Lock()
-	defer r.versionCacheMu.Unlock()
-	entry, ok := r.versionCache[boolCacheKey(beta)]
-	if !ok || time.Since(entry.at) > dstVersionCacheTTL {
+	entry, ok := r.quickVersionCache[cacheKey]
+	r.versionCacheMu.Unlock()
+	if ok && time.Since(entry.at) < quickVersionCacheTTL {
+		return entry.version, true
+	}
+
+	r.quickFetchMu.Lock()
+	defer r.quickFetchMu.Unlock()
+	// 拿到锁后再查一次缓存，避免并发重复请求。
+	r.versionCacheMu.Lock()
+	entry, ok = r.quickVersionCache[cacheKey]
+	r.versionCacheMu.Unlock()
+	if ok && time.Since(entry.at) < quickVersionCacheTTL {
+		return entry.version, true
+	}
+
+	version, err := r.latestDstVersionViaQuickAPI(beta)
+	if err != nil || version <= 0 {
+		if err != nil {
+			log.Println("快速版本查询失败:", err)
+		}
 		return 0, false
 	}
-	return entry.version, true
-}
-
-func (r *PathResolver) cacheLatestDstVersion(beta bool, version int64) {
 	r.versionCacheMu.Lock()
-	defer r.versionCacheMu.Unlock()
-	if r.versionCache == nil {
-		r.versionCache = map[int]dstVersionCacheEntry{}
+	if r.quickVersionCache == nil {
+		r.quickVersionCache = map[int]dstVersionCacheEntry{}
 	}
-	r.versionCache[boolCacheKey(beta)] = dstVersionCacheEntry{version: version, at: time.Now()}
+	r.quickVersionCache[cacheKey] = dstVersionCacheEntry{version: version, at: time.Now()}
+	r.versionCacheMu.Unlock()
+	return version, true
 }
 
-func boolCacheKey(beta bool) int {
-	if beta {
-		return 1
-	}
-	return 0
-}
-
-type upToDateCheckResponse struct {
-	Response struct {
-		Success         bool  `json:"success"`
-		UpToDate        bool  `json:"up_to_date"`
-		RequiredVersion int64 `json:"required_version"`
-	} `json:"response"`
-}
-
-// latestDstVersionViaSteamAPI 使用 Steam 官方 UpToDateCheck 接口查询最新 buildid。
-// 需要 config.yml 中配置 steamAPIKey；version 参数使用本地 version.txt 的 buildid。
-func (r *PathResolver) latestDstVersionViaSteamAPI(apiKey string, localVersion int64) (int64, error) {
-	endpoint := fmt.Sprintf(
-		"https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/?appid=%s&version=%d&key=%s",
-		steamCmdAppID, localVersion, url.QueryEscape(apiKey),
-	)
-	client := &http.Client{Timeout: steamAPIVersionTimeout}
-	resp, err := client.Get(endpoint)
+// latestDstVersionViaQuickAPI 使用 api.steamcmd.net 获取 public/updatebeta 分支 buildid。
+func (r *PathResolver) latestDstVersionViaQuickAPI(beta bool) (int64, error) {
+	client := &http.Client{Timeout: quickVersionTimeout}
+	resp, err := client.Get(quickVersionURL)
 	if err != nil {
 		return 0, err
 	}
@@ -170,20 +206,100 @@ func (r *PathResolver) latestDstVersionViaSteamAPI(apiKey string, localVersion i
 	if err != nil {
 		return 0, err
 	}
-	var payload upToDateCheckResponse
+	return parseQuickAPIResponse(body, beta)
+}
+
+type quickAPIResponse struct {
+	Status string `json:"status"`
+	Data   map[string]struct {
+		Branches map[string]struct {
+			BuildID string `json:"buildid"`
+		} `json:"branches"`
+	} `json:"data"`
+}
+
+// parseQuickAPIResponse 从 steamcmd.net 返回的 JSON 中解析指定分支 buildid。
+func parseQuickAPIResponse(body []byte, beta bool) (int64, error) {
+	var payload quickAPIResponse
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return 0, err
 	}
-	if !payload.Response.Success {
-		return 0, fmt.Errorf("接口返回 success=false")
+	if payload.Status != "success" {
+		return 0, fmt.Errorf("接口状态不是 success: %q", payload.Status)
 	}
-	if payload.Response.RequiredVersion > 0 {
-		return payload.Response.RequiredVersion, nil
+	app, ok := payload.Data[steamCmdAppID]
+	if !ok {
+		return 0, fmt.Errorf("返回数据中没有 appid %s", steamCmdAppID)
 	}
-	if payload.Response.UpToDate {
-		return localVersion, nil
+	branchName := "public"
+	if beta {
+		branchName = "updatebeta"
 	}
-	return 0, fmt.Errorf("接口未返回 required_version")
+	branch, ok := app.Branches[branchName]
+	if !ok {
+		return 0, fmt.Errorf("返回数据中没有 %s 分支", branchName)
+	}
+	buildID, err := strconv.ParseInt(branch.BuildID, 10, 64)
+	if err != nil || buildID <= 0 {
+		return 0, fmt.Errorf("分支 buildid 无效: %q", branch.BuildID)
+	}
+	return buildID, nil
+}
+
+// cachedSteamCmdVersion 读取 SteamCMD 校验缓存（不限新鲜度，由调用方判断）。
+func (r *PathResolver) cachedSteamCmdVersion(beta bool) (int64, time.Time, bool) {
+	r.versionCacheMu.Lock()
+	defer r.versionCacheMu.Unlock()
+	entry, ok := r.versionCache[boolCacheKey(beta)]
+	if !ok {
+		return 0, time.Time{}, false
+	}
+	return entry.version, entry.at, true
+}
+
+func (r *PathResolver) cacheSteamCmdVersion(beta bool, version int64) {
+	r.versionCacheMu.Lock()
+	defer r.versionCacheMu.Unlock()
+	if r.versionCache == nil {
+		r.versionCache = map[int]dstVersionCacheEntry{}
+	}
+	r.versionCache[boolCacheKey(beta)] = dstVersionCacheEntry{version: version, at: time.Now()}
+}
+
+// steamCmdVersionChecked 同步执行一次 SteamCMD 校验并更新缓存。
+func (r *PathResolver) steamCmdVersionChecked(dstCfg dstConfig.DstConfig, beta bool) (int64, error) {
+	r.versionFetchMu.Lock()
+	defer r.versionFetchMu.Unlock()
+	// 拿到锁后若刚校验过则直接复用，避免并发重复启动 SteamCMD。
+	if version, at, ok := r.cachedSteamCmdVersion(beta); ok && time.Since(at) < steamCmdResultMinAge {
+		return version, nil
+	}
+	version, err := r.latestDstVersionViaSteamCmd(dstCfg)
+	if err != nil {
+		return 0, err
+	}
+	r.cacheSteamCmdVersion(beta, version)
+	return version, nil
+}
+
+// refreshSteamCmdVersionAsync 后台执行 SteamCMD 校验，不阻塞页面。
+func (r *PathResolver) refreshSteamCmdVersionAsync(dstCfg dstConfig.DstConfig, beta bool) {
+	go func() {
+		if !r.versionFetchMu.TryLock() {
+			return
+		}
+		defer r.versionFetchMu.Unlock()
+		if _, at, ok := r.cachedSteamCmdVersion(beta); ok && time.Since(at) < steamCmdValidateTTL {
+			return
+		}
+		version, err := r.latestDstVersionViaSteamCmd(dstCfg)
+		if err != nil {
+			log.Println("后台 SteamCMD 版本校验失败:", err)
+			return
+		}
+		r.cacheSteamCmdVersion(beta, version)
+		log.Printf("后台 SteamCMD 版本校验完成：buildid %d", version)
+	}()
 }
 
 // latestDstVersionViaSteamCmd 使用 SteamCMD 的 app_info_print 查询最新 buildid（匿名可用）。
@@ -294,6 +410,13 @@ func steamCmdKeyValue(line string) (key, value string, ok bool) {
 		return trimQuotes(fields[0]), "", true
 	}
 	return trimQuotes(fields[0]), trimQuotes(strings.Join(fields[1:], " ")), true
+}
+
+func boolCacheKey(beta bool) int {
+	if beta {
+		return 1
+	}
+	return 0
 }
 
 // tailVersionOutput 保留输出尾部，避免错误信息过长。

@@ -16,10 +16,13 @@ type PathResolver struct {
 	homePath  string
 	dstConfig dstConfig.Config
 
-	// 最新版本查询缓存：避免每次刷新面板都启动 SteamCMD。
-	versionCacheMu sync.Mutex
-	versionFetchMu sync.Mutex
-	versionCache   map[int]dstVersionCacheEntry
+	// 版本查询缓存：
+	// versionCache 保存 SteamCMD 权威校验结果（24h 内可信），quickVersionCache 保存快速接口结果（5 分钟）。
+	versionCacheMu    sync.Mutex
+	versionFetchMu    sync.Mutex
+	quickFetchMu      sync.Mutex
+	versionCache      map[int]dstVersionCacheEntry
+	quickVersionCache map[int]dstVersionCacheEntry
 }
 
 func NewPathResolver(dstConfig dstConfig.Config) (*PathResolver, error) {
@@ -31,9 +34,10 @@ func NewPathResolver(dstConfig dstConfig.Config) (*PathResolver, error) {
 	}
 
 	return &PathResolver{
-		homePath:     home,
-		dstConfig:    dstConfig,
-		versionCache: map[int]dstVersionCacheEntry{},
+		homePath:          home,
+		dstConfig:         dstConfig,
+		versionCache:      map[int]dstVersionCacheEntry{},
+		quickVersionCache: map[int]dstVersionCacheEntry{},
 	}, nil
 }
 
@@ -209,10 +213,6 @@ func (r *PathResolver) GetLocalDstVersion(clusterName string) (int64, error) {
 	}
 	versionTextPath := filepath.Join(dstInstallDir, "version.txt")
 	return r.dstVersion(versionTextPath)
-}
-
-func (r *PathResolver) GetLastDstVersion(clusterName string) (int64, error) {
-	return r.getLastDstVersion(clusterName)
 }
 
 func (r *PathResolver) dstVersion(versionTextPath string) (int64, error) {

@@ -114,7 +114,7 @@ func Register(cfg *config.Config, db *gorm.DB, router *gin.RouterGroup) {
 	initCollectors(resolverService, dstConfigService)
 
 	//  handler
-	updateHandler := handler.NewUpdateHandler(updateService)
+	updateHandler := handler.NewUpdateHandler(updateService, resolverService)
 	gameHandler := handler.NewGameHandler(gameProcess, levelService, gameArchiveService, levelConfigUtils, resolverService, modService)
 	gameConfigHandler := handler.NewGameConfigHandler(gameConfigService)
 	dstConfigHandler := handler.NewDstConfigHandler(dstConfigService, resolverService)
