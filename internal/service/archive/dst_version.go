@@ -3,11 +3,11 @@ package archive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"dst-admin-go/internal/config"
+	"dst-admin-go/internal/pkg/utils/cmdrun"
 	"dst-admin-go/internal/pkg/utils/fileUtils"
 	"dst-admin-go/internal/pkg/utils/steamcmd"
 	"dst-admin-go/internal/service/dstConfig"
@@ -33,8 +34,10 @@ const (
 	quickVersionTimeout = 6 * time.Second
 	// SteamCMD 校验结果的短期复用时间，避免同一时刻重复执行。
 	steamCmdResultMinAge = 10 * time.Second
+	// SteamCMD 校验失败后的冷却时间：SteamCMD 不可用时避免每次页面请求都同步重试（每次最长 25s）。
+	steamCmdFailureCooldown = 2 * time.Minute
 
-	// 每日自动校验失败后的重试间隔与次数。
+	// 每日自动校验失败后的重试次数与间隔（总尝试次数 = 1 次首检 + 4 次重试）。
 	dailyCheckRetryInterval = 15 * time.Minute
 	dailyCheckMaxRetries    = 4
 )
@@ -134,8 +137,10 @@ func (r *PathResolver) GetLatestDstVersionInfoForce(clusterName string) (LatestD
 	beta := dstCfg.Beta == 1
 	version, err := r.latestDstVersionViaSteamCmd(dstCfg)
 	if err != nil {
+		r.markSteamCmdFailure(beta)
 		return LatestDstVersionInfo{Version: -1, Source: versionSourceUnavailable}, err
 	}
+	r.clearSteamCmdFailure(beta)
 	r.cacheSteamCmdVersion(beta, version)
 	return LatestDstVersionInfo{Version: version, Source: versionSourceSteamCmd, CheckedAt: time.Now().Unix()}, nil
 }
@@ -180,33 +185,69 @@ func (r *PathResolver) runDailyVersionCheck() {
 	}
 	log.Printf("每日版本检查已启用：每天 %02d:%02d 使用 SteamCMD 校验一次游戏版本", hour, minute)
 
+	// 面板在当天检查时间之后才启动时，补做一次检查（例如 10:00 重启面板，不必等到次日 04:00）。
+	if r.shouldCatchUpToday(hour, minute) {
+		log.Println("已过今日版本检查时间且今日尚未做过真实校验，立即补做一次")
+		r.runDailyCheckWithRetries()
+	}
+
 	for {
-		now := time.Now()
-		next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
-		if !next.After(now) {
-			next = next.Add(24 * time.Hour)
-		}
+		next := r.nextDailyCheckTime(hour, minute)
 		log.Printf("下一次 SteamCMD 版本检查时间：%s", next.Format("2006-01-02 15:04:05"))
 		timer := time.NewTimer(time.Until(next))
 		<-timer.C
+		r.runDailyCheckWithRetries()
+	}
+}
 
-		dstCfg, cfgErr := r.dstConfig.GetDstConfig("")
-		if cfgErr != nil || dstCfg.Cluster == "" {
-			log.Println("每日版本检查失败：无法获取集群配置或集群名", cfgErr)
-			continue
+// nextDailyCheckTime 返回下一次每日检查时间（严格晚于当前时间）。
+func (r *PathResolver) nextDailyCheckTime(hour, minute int) time.Time {
+	now := time.Now()
+	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
+	return next
+}
+
+// shouldCatchUpToday 判断当天计划时间已过、但今天还没有成功的 SteamCMD 校验。
+func (r *PathResolver) shouldCatchUpToday(hour, minute int) bool {
+	now := time.Now()
+	todaySchedule := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+	if now.Before(todaySchedule) {
+		return false
+	}
+	dstCfg, err := r.dstConfig.GetDstConfig("")
+	if err != nil || dstCfg.Cluster == "" {
+		return false
+	}
+	_, checkedAt, ok := r.cachedSteamCmdVersion(dstCfg.Beta == 1)
+	if !ok {
+		return true
+	}
+	return checkedAt.Before(todaySchedule)
+}
+
+// runDailyCheckWithRetries 执行一次每日检查：1 次首检 + dailyCheckMaxRetries 次重试。
+func (r *PathResolver) runDailyCheckWithRetries() {
+	dstCfg, cfgErr := r.dstConfig.GetDstConfig("")
+	if cfgErr != nil || dstCfg.Cluster == "" {
+		log.Println("每日版本检查失败：无法获取集群配置或集群名", cfgErr)
+		return
+	}
+	totalAttempts := 1 + dailyCheckMaxRetries
+	for attempt := 1; attempt <= totalAttempts; attempt++ {
+		info, checkErr := r.GetLatestDstVersionInfoForce(dstCfg.Cluster)
+		if checkErr == nil {
+			log.Printf("每日版本检查完成：buildid=%d，时间=%s", info.Version, time.Unix(info.CheckedAt, 0).Format("2006-01-02 15:04:05"))
+			return
 		}
-		for attempt := 1; attempt <= dailyCheckMaxRetries; attempt++ {
-			info, checkErr := r.GetLatestDstVersionInfoForce(dstCfg.Cluster)
-			if checkErr == nil {
-				log.Printf("每日版本检查完成：buildid=%d，时间=%s", info.Version, time.Unix(info.CheckedAt, 0).Format("2006-01-02 15:04:05"))
-				break
-			}
-			log.Printf("每日版本检查失败（第 %d/%d 次）: %v", attempt, dailyCheckMaxRetries, checkErr)
-			if attempt < dailyCheckMaxRetries {
-				time.Sleep(dailyCheckRetryInterval)
-			}
+		log.Printf("每日版本检查失败（第 %d/%d 次，其中重试 %d 次）: %v", attempt, totalAttempts, dailyCheckMaxRetries, checkErr)
+		if attempt < totalAttempts {
+			time.Sleep(dailyCheckRetryInterval)
 		}
 	}
+	log.Println("每日版本检查今日已放弃，等待下一次计划时间")
 }
 
 func parseDailyCheckTime(value string) (int, int, error) {
@@ -374,6 +415,31 @@ func (r *PathResolver) cacheSteamCmdVersion(beta bool, version int64) {
 	r.versionCache[boolCacheKey(beta)] = dstVersionCacheEntry{version: version, at: time.Now()}
 }
 
+// steamCmdFailureBlocked 返回该分支是否处于 SteamCMD 校验失败冷却期。
+func (r *PathResolver) steamCmdFailureBlocked(beta bool) bool {
+	r.steamFailMu.Lock()
+	defer r.steamFailMu.Unlock()
+	failedAt, ok := r.steamFailAt[boolCacheKey(beta)]
+	return ok && time.Since(failedAt) < steamCmdFailureCooldown
+}
+
+// markSteamCmdFailure 记录一次 SteamCMD 校验失败，冷却期内不再同步重试。
+func (r *PathResolver) markSteamCmdFailure(beta bool) {
+	r.steamFailMu.Lock()
+	defer r.steamFailMu.Unlock()
+	if r.steamFailAt == nil {
+		r.steamFailAt = map[int]time.Time{}
+	}
+	r.steamFailAt[boolCacheKey(beta)] = time.Now()
+}
+
+// clearSteamCmdFailure 校验成功后清除失败冷却。
+func (r *PathResolver) clearSteamCmdFailure(beta bool) {
+	r.steamFailMu.Lock()
+	defer r.steamFailMu.Unlock()
+	delete(r.steamFailAt, boolCacheKey(beta))
+}
+
 // steamCmdVersionChecked 同步执行一次 SteamCMD 校验并更新缓存。
 func (r *PathResolver) steamCmdVersionChecked(dstCfg dstConfig.DstConfig, beta bool) (int64, error) {
 	r.versionFetchMu.Lock()
@@ -382,10 +448,16 @@ func (r *PathResolver) steamCmdVersionChecked(dstCfg dstConfig.DstConfig, beta b
 	if version, at, ok := r.cachedSteamCmdVersion(beta); ok && time.Since(at) < steamCmdResultMinAge {
 		return version, nil
 	}
+	// SteamCMD 刚失败过则不再同步重试：页面加载/存档页等非强制入口不应因此阻塞 25s。
+	if r.steamCmdFailureBlocked(beta) {
+		return 0, fmt.Errorf("SteamCMD 最近校验失败（%s 内不重复尝试），请稍后再试", steamCmdFailureCooldown)
+	}
 	version, err := r.latestDstVersionViaSteamCmd(dstCfg)
 	if err != nil {
+		r.markSteamCmdFailure(beta)
 		return 0, err
 	}
+	r.clearSteamCmdFailure(beta)
 	r.cacheSteamCmdVersion(beta, version)
 	return version, nil
 }
@@ -400,11 +472,16 @@ func (r *PathResolver) refreshSteamCmdVersionAsync(dstCfg dstConfig.DstConfig, b
 		if _, at, ok := r.cachedSteamCmdVersion(beta); ok && time.Since(at) < steamCmdValidateTTL {
 			return
 		}
+		if r.steamCmdFailureBlocked(beta) {
+			return
+		}
 		version, err := r.latestDstVersionViaSteamCmd(dstCfg)
 		if err != nil {
+			r.markSteamCmdFailure(beta)
 			log.Println("后台 SteamCMD 版本校验失败:", err)
 			return
 		}
+		r.clearSteamCmdFailure(beta)
 		r.cacheSteamCmdVersion(beta, version)
 		log.Printf("后台 SteamCMD 版本校验完成：buildid %d", version)
 	}()
@@ -431,18 +508,22 @@ func (r *PathResolver) latestDstVersionViaSteamCmd(dstCfg dstConfig.DstConfig) (
 	}
 	defer steamcmd.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), steamCmdVersionTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "+login", "anonymous", "+app_info_print", steamCmdAppID, "+quit")
-	cmd.Dir = steamCmdPath
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return 0, fmt.Errorf("查询超时（%s）", steamCmdVersionTimeout)
-	}
+	// 超时必须终止整个进程组：steamcmd.sh 下的 steamcmd 是孙进程，
+	// 只杀 direct child 会让检查实际不返回或残留进程继续占着 SteamCMD 目录。
+	output, err := cmdrun.Run(
+		context.Background(),
+		steamCmdVersionTimeout,
+		steamCmdPath,
+		binary,
+		"+login", "anonymous", "+app_info_print", steamCmdAppID, "+quit",
+	)
 	if err != nil {
-		return 0, fmt.Errorf("执行失败: %v，输出尾部: %s", err, tailVersionOutput(string(output), 300))
+		if errors.Is(err, cmdrun.ErrTimeout) {
+			return 0, fmt.Errorf("查询超时（%s）", steamCmdVersionTimeout)
+		}
+		return 0, fmt.Errorf("执行失败: %v，输出尾部: %s", err, tailVersionOutput(output, 300))
 	}
-	return parseSteamCmdBuildId(string(output), dstCfg.Beta == 1)
+	return parseSteamCmdBuildId(output, dstCfg.Beta == 1)
 }
 
 // parseSteamCmdBuildId 从 `steamcmd +app_info_print 343050` 输出中解析指定分支的 buildid。

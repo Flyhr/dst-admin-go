@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type PathResolver struct {
@@ -23,6 +24,9 @@ type PathResolver struct {
 	quickFetchMu      sync.Mutex
 	versionCache      map[int]dstVersionCacheEntry
 	quickVersionCache map[int]dstVersionCacheEntry
+	// steamFailAt 记录 SteamCMD 校验失败时间，冷却期内不再同步重试，避免页面请求被 25s 超时拖住。
+	steamFailMu sync.Mutex
+	steamFailAt map[int]time.Time
 
 	// 每日版本检查只启动一次。
 	dailyCheckOnce sync.Once
@@ -41,6 +45,7 @@ func NewPathResolver(dstConfig dstConfig.Config) (*PathResolver, error) {
 		dstConfig:         dstConfig,
 		versionCache:      map[int]dstVersionCacheEntry{},
 		quickVersionCache: map[int]dstVersionCacheEntry{},
+		steamFailAt:       map[int]time.Time{},
 	}, nil
 }
 

@@ -2,22 +2,24 @@ package update
 
 import (
 	"context"
+	"dst-admin-go/internal/pkg/utils/cmdrun"
 	"dst-admin-go/internal/pkg/utils/steamcmd"
 	"dst-admin-go/internal/service/dstConfig"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
 const (
-	// 普通更新最长执行时间。
+	// 普通更新总预算（含重试）。
 	updateCommandTimeout = 45 * time.Minute
-	// 深度修复（validate）最长执行时间。
+	// 深度修复（validate）总预算（含重试）。
 	repairCommandTimeout = 90 * time.Minute
+	// 首次尝试失败后，剩余预算低于该值就不再重试，避免总耗时翻倍。
+	minUpdateRetryBudget = 5 * time.Minute
 )
 
 type LinuxUpdate struct {
@@ -62,53 +64,46 @@ func (u LinuxUpdate) run(clusterName string, deep bool) error {
 	defer restoreModsSetupFile(setupPath, setupContent, setupHad)
 
 	action := "更新游戏"
-	timeout := updateCommandTimeout
+	totalTimeout := updateCommandTimeout
 	if deep {
 		action = "深度修复游戏"
-		timeout = repairCommandTimeout
+		totalTimeout = repairCommandTimeout
 	}
 
 	// 与版本检查共用 SteamCMD 锁，避免并发操作同一个 Steam 客户端。
 	steamcmd.Lock()
 	defer steamcmd.Unlock()
 
+	deadline := time.Now().Add(totalTimeout)
 	log.Println("正在"+action, "cluster: ", clusterName, "command: ", updateCommand)
-	_, err = runCommandWithTimeout(updateCommand, timeout)
-	if err == nil {
+
+	output, firstErr := cmdrun.Run(context.Background(), totalTimeout, "", "sh", "-c", updateCommand)
+	if firstErr == nil {
 		return nil
 	}
+	log.Println(action+"首次尝试失败: ", firstErr, "输出尾部: ", cmdrun.Tail(strings.TrimSpace(output), 600))
 
-	log.Println(action+"失败，清理 Steam 下载缓存后重试一次", "cluster: ", clusterName, "error: ", err)
+	remaining := time.Until(deadline)
+	if remaining < minUpdateRetryBudget {
+		return fmt.Errorf("%s（总预算 %s 已用尽，不再重试）", commandErrorText(firstErr, output), totalTimeout)
+	}
+
+	log.Println(action+"失败，清理 Steam 下载缓存后重试一次，剩余预算:", remaining.Round(time.Second))
 	cleanupSteamDownloadCache(config)
-	_, retryErr := runCommandWithTimeout(updateCommand, timeout)
+	retryOutput, retryErr := cmdrun.Run(context.Background(), remaining, "", "sh", "-c", updateCommand)
 	if retryErr != nil {
-		return retryErr
+		return fmt.Errorf("首次尝试失败: %s；重试失败: %s", commandErrorText(firstErr, output), commandErrorText(retryErr, retryOutput))
 	}
 	return nil
 }
 
-// runCommandWithTimeout 执行 shell 命令并强制超时，返回输出尾部便于页面展示错误。
-func runCommandWithTimeout(command string, timeout time.Duration) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
-	output, err := cmd.CombinedOutput()
-	text := string(output)
-	if ctx.Err() == context.DeadlineExceeded {
-		return text, fmt.Errorf("执行超时（限制 %s），输出尾部: %s", timeout, tailCommandOutput(text, 600))
+// commandErrorText 把错误和输出尾部拼成适合页面展示的文本。
+func commandErrorText(err error, output string) string {
+	text := strings.TrimSpace(output)
+	if text == "" {
+		return err.Error()
 	}
-	if err != nil {
-		return text, fmt.Errorf("执行失败: %v，输出尾部: %s", err, tailCommandOutput(text, 600))
-	}
-	return text, nil
-}
-
-func tailCommandOutput(text string, limit int) string {
-	text = strings.TrimSpace(text)
-	if len(text) <= limit {
-		return text
-	}
-	return "..." + text[len(text)-limit:]
+	return fmt.Sprintf("%s，输出尾部: %s", err.Error(), cmdrun.Tail(text, 600))
 }
 
 // cleanupSteamDownloadCache 清理下载中间状态，保留 appmanifest 以便更新后还能读取本地 buildid。
