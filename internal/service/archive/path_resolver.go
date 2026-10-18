@@ -23,6 +23,9 @@ type PathResolver struct {
 	quickFetchMu      sync.Mutex
 	versionCache      map[int]dstVersionCacheEntry
 	quickVersionCache map[int]dstVersionCacheEntry
+
+	// 每日版本检查只启动一次。
+	dailyCheckOnce sync.Once
 }
 
 func NewPathResolver(dstConfig dstConfig.Config) (*PathResolver, error) {

@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"dst-admin-go/internal/config"
 	"dst-admin-go/internal/pkg/utils/fileUtils"
+	"dst-admin-go/internal/pkg/utils/steamcmd"
 	"dst-admin-go/internal/service/dstConfig"
 )
 
@@ -31,6 +33,10 @@ const (
 	quickVersionTimeout = 6 * time.Second
 	// SteamCMD 校验结果的短期复用时间，避免同一时刻重复执行。
 	steamCmdResultMinAge = 10 * time.Second
+
+	// 每日自动校验失败后的重试间隔与次数。
+	dailyCheckRetryInterval = 15 * time.Minute
+	dailyCheckMaxRetries    = 4
 )
 
 const (
@@ -43,7 +49,8 @@ const (
 	versionSourceUnavailable = "unavailable"
 )
 
-// LatestDstVersionInfo 最新版本查询结果，附带来源与最近一次 SteamCMD 校验时间。
+// LatestDstVersionInfo 最新版本查询结果。
+// CheckedAt 表示这份数据真正被外部来源更新/校验的时间（unix 秒），用于页面展示“检查时间”。
 type LatestDstVersionInfo struct {
 	Version   int64
 	Source    string
@@ -64,11 +71,11 @@ func (r *PathResolver) GetLastDstVersion(clusterName string) (int64, error) {
 	return info.Version, nil
 }
 
-// GetLatestDstVersionInfo 查询最新 DST 专用服务器 buildid。
+// GetLatestDstVersionInfo 查询最新 DST 专用服务器 buildid（允许使用缓存）。
 //
 // 设计：
 //  1. 快速层：api.steamcmd.net（第三方、无需认证）用于快速展示，缓存 5 分钟；
-//  2. 权威层：本机 SteamCMD `app_info_print 343050`，结果缓存 24 小时，并且至少每天校验一次；
+//  2. 权威层：本机 SteamCMD `app_info_print 343050`，缓存 24 小时，并且至少每天校验一次；
 //  3. 两者不一致时以 SteamCMD 为准；快速层失败时使用 SteamCMD 缓存或同步查询；
 //  4. 所有失败都不会被当成“已是最新”，而是返回错误/未知来源。
 func (r *PathResolver) GetLatestDstVersionInfo(clusterName string) (LatestDstVersionInfo, error) {
@@ -78,7 +85,7 @@ func (r *PathResolver) GetLatestDstVersionInfo(clusterName string) (LatestDstVer
 	}
 	beta := dstCfg.Beta == 1
 
-	quickVersion, quickOK := r.quickLatestDstVersion(beta)
+	quickVersion, quickAt, quickOK := r.quickLatestDstVersion(beta)
 	steamVersion, steamAt, steamOK := r.cachedSteamCmdVersion(beta)
 	steamFresh := steamOK && time.Since(steamAt) < steamCmdValidateTTL
 
@@ -98,11 +105,7 @@ func (r *PathResolver) GetLatestDstVersionInfo(clusterName string) (LatestDstVer
 		if !steamFresh {
 			r.refreshSteamCmdVersionAsync(dstCfg, beta)
 		}
-		checkedAt := int64(0)
-		if steamOK {
-			checkedAt = steamAt.Unix()
-		}
-		return LatestDstVersionInfo{Version: quickVersion, Source: versionSourceQuick, CheckedAt: checkedAt}, nil
+		return LatestDstVersionInfo{Version: quickVersion, Source: versionSourceQuick, CheckedAt: quickAt.Unix()}, nil
 	}
 	// 快速检查不可用：使用未过期的 SteamCMD 缓存。
 	if steamFresh {
@@ -119,6 +122,110 @@ func (r *PathResolver) GetLatestDstVersionInfo(clusterName string) (LatestDstVer
 		return LatestDstVersionInfo{Version: steamVersion, Source: versionSourceStaleCache, CheckedAt: steamAt.Unix()}, nil
 	}
 	return LatestDstVersionInfo{Version: -1, Source: versionSourceUnavailable}, fmt.Errorf("无法获取最新游戏 buildid")
+}
+
+// GetLatestDstVersionInfoForce 强制用本机 SteamCMD 做一次权威版本检查（手动刷新/每日定时）。
+// 如果 SteamCMD 正被更新/修复任务占用，会返回错误，由调用方提示稍后重试。
+func (r *PathResolver) GetLatestDstVersionInfoForce(clusterName string) (LatestDstVersionInfo, error) {
+	dstCfg, err := r.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return LatestDstVersionInfo{Version: -1, Source: versionSourceUnavailable}, err
+	}
+	beta := dstCfg.Beta == 1
+	version, err := r.latestDstVersionViaSteamCmd(dstCfg)
+	if err != nil {
+		return LatestDstVersionInfo{Version: -1, Source: versionSourceUnavailable}, err
+	}
+	r.cacheSteamCmdVersion(beta, version)
+	return LatestDstVersionInfo{Version: version, Source: versionSourceSteamCmd, CheckedAt: time.Now().Unix()}, nil
+}
+
+// InvalidateVersionCache 清理版本缓存（更新/修复完成后调用，避免页面显示旧状态）。
+func (r *PathResolver) InvalidateVersionCache(clusterName string) {
+	dstCfg, err := r.dstConfig.GetDstConfig(clusterName)
+	if err != nil {
+		return
+	}
+	key := boolCacheKey(dstCfg.Beta == 1)
+	r.versionCacheMu.Lock()
+	delete(r.versionCache, key)
+	delete(r.quickVersionCache, key)
+	r.versionCacheMu.Unlock()
+}
+
+// StartDailyVersionCheck 启动每日固定时间的 SteamCMD 权威版本检查（只启动一次）。
+func (r *PathResolver) StartDailyVersionCheck() {
+	r.dailyCheckOnce.Do(func() {
+		go r.runDailyVersionCheck()
+	})
+}
+
+func (r *PathResolver) runDailyVersionCheck() {
+	if config.Cfg == nil {
+		return
+	}
+	enable := true
+	if config.Cfg.DailyVersionCheck.Enable != nil {
+		enable = *config.Cfg.DailyVersionCheck.Enable
+	}
+	if !enable {
+		log.Println("每日版本检查已禁用（dailyVersionCheck.enable=false）")
+		return
+	}
+	checkTime := strings.TrimSpace(config.Cfg.DailyVersionCheck.Time)
+	hour, minute, err := parseDailyCheckTime(checkTime)
+	if err != nil {
+		log.Println("每日版本检查时间配置无效，使用默认 04:00:", err)
+		hour, minute = 4, 0
+	}
+	log.Printf("每日版本检查已启用：每天 %02d:%02d 使用 SteamCMD 校验一次游戏版本", hour, minute)
+
+	for {
+		now := time.Now()
+		next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, now.Location())
+		if !next.After(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		log.Printf("下一次 SteamCMD 版本检查时间：%s", next.Format("2006-01-02 15:04:05"))
+		timer := time.NewTimer(time.Until(next))
+		<-timer.C
+
+		dstCfg, cfgErr := r.dstConfig.GetDstConfig("")
+		if cfgErr != nil || dstCfg.Cluster == "" {
+			log.Println("每日版本检查失败：无法获取集群配置或集群名", cfgErr)
+			continue
+		}
+		for attempt := 1; attempt <= dailyCheckMaxRetries; attempt++ {
+			info, checkErr := r.GetLatestDstVersionInfoForce(dstCfg.Cluster)
+			if checkErr == nil {
+				log.Printf("每日版本检查完成：buildid=%d，时间=%s", info.Version, time.Unix(info.CheckedAt, 0).Format("2006-01-02 15:04:05"))
+				break
+			}
+			log.Printf("每日版本检查失败（第 %d/%d 次）: %v", attempt, dailyCheckMaxRetries, checkErr)
+			if attempt < dailyCheckMaxRetries {
+				time.Sleep(dailyCheckRetryInterval)
+			}
+		}
+	}
+}
+
+func parseDailyCheckTime(value string) (int, int, error) {
+	if value == "" {
+		return 4, 0, nil
+	}
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("时间格式应为 HH:MM")
+	}
+	hour, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, 0, fmt.Errorf("小时无效: %q", parts[0])
+	}
+	minute, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, 0, fmt.Errorf("分钟无效: %q", parts[1])
+	}
+	return hour, minute, nil
 }
 
 // GetLocalDstBuildId 读取本机已安装的 DST 专用服务器 buildid。
@@ -155,14 +262,14 @@ func parseAppManifestBuildId(content string) (int64, error) {
 	return 0, fmt.Errorf("appmanifest 中未找到 buildid")
 }
 
-// quickLatestDstVersion 调用第三方快速接口查询最新 buildid（缓存 5 分钟）。
-func (r *PathResolver) quickLatestDstVersion(beta bool) (int64, bool) {
+// quickLatestDstVersion 调用第三方快速接口查询最新 buildid（缓存 5 分钟），同时返回数据获取时间。
+func (r *PathResolver) quickLatestDstVersion(beta bool) (int64, time.Time, bool) {
 	cacheKey := boolCacheKey(beta)
 	r.versionCacheMu.Lock()
 	entry, ok := r.quickVersionCache[cacheKey]
 	r.versionCacheMu.Unlock()
 	if ok && time.Since(entry.at) < quickVersionCacheTTL {
-		return entry.version, true
+		return entry.version, entry.at, true
 	}
 
 	r.quickFetchMu.Lock()
@@ -172,7 +279,7 @@ func (r *PathResolver) quickLatestDstVersion(beta bool) (int64, bool) {
 	entry, ok = r.quickVersionCache[cacheKey]
 	r.versionCacheMu.Unlock()
 	if ok && time.Since(entry.at) < quickVersionCacheTTL {
-		return entry.version, true
+		return entry.version, entry.at, true
 	}
 
 	version, err := r.latestDstVersionViaQuickAPI(beta)
@@ -180,15 +287,16 @@ func (r *PathResolver) quickLatestDstVersion(beta bool) (int64, bool) {
 		if err != nil {
 			log.Println("快速版本查询失败:", err)
 		}
-		return 0, false
+		return 0, time.Time{}, false
 	}
+	now := time.Now()
 	r.versionCacheMu.Lock()
 	if r.quickVersionCache == nil {
 		r.quickVersionCache = map[int]dstVersionCacheEntry{}
 	}
-	r.quickVersionCache[cacheKey] = dstVersionCacheEntry{version: version, at: time.Now()}
+	r.quickVersionCache[cacheKey] = dstVersionCacheEntry{version: version, at: now}
 	r.versionCacheMu.Unlock()
-	return version, true
+	return version, now, true
 }
 
 // latestDstVersionViaQuickAPI 使用 api.steamcmd.net 获取 public/updatebeta 分支 buildid。
@@ -317,6 +425,11 @@ func (r *PathResolver) latestDstVersionViaSteamCmd(dstCfg dstConfig.DstConfig) (
 	if !fileUtils.Exists(binary) {
 		return 0, fmt.Errorf("未找到 SteamCMD: %s", binary)
 	}
+	// 与更新/修复共用 SteamCMD 锁；忙时直接返回错误，避免两个 SteamCMD 实例互相干扰。
+	if !steamcmd.TryLock() {
+		return 0, fmt.Errorf("SteamCMD 正在执行其他任务，请稍后再试")
+	}
+	defer steamcmd.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), steamCmdVersionTimeout)
 	defer cancel()

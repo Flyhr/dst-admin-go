@@ -112,9 +112,11 @@ func Register(cfg *config.Config, db *gorm.DB, router *gin.RouterGroup) {
 
 	// init
 	initCollectors(resolverService, dstConfigService)
+	// 每日固定时间用 SteamCMD 做一次权威版本检查（配置项 dailyVersionCheck）。
+	resolverService.StartDailyVersionCheck()
 
 	//  handler
-	updateHandler := handler.NewUpdateHandler(updateService, resolverService)
+	updateHandler := handler.NewUpdateHandler(updateService, resolverService, gameProcess, levelConfigUtils)
 	gameHandler := handler.NewGameHandler(gameProcess, levelService, gameArchiveService, levelConfigUtils, resolverService, modService)
 	gameConfigHandler := handler.NewGameConfigHandler(gameConfigService)
 	dstConfigHandler := handler.NewDstConfigHandler(dstConfigService, resolverService)

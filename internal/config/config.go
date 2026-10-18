@@ -25,6 +25,11 @@ type Config struct {
 		CheckInterval       int  `yaml:"checkInterval"`
 		UpdateCheckInterval int  `yaml:"updateCheckInterval"`
 	} `yaml:"autoUpdateModinfo"`
+	// DailyVersionCheck 每日固定时间用 SteamCMD 做一次权威版本检查。
+	DailyVersionCheck struct {
+		Enable *bool  `yaml:"enable"`
+		Time   string `yaml:"time"`
+	} `yaml:"dailyVersionCheck"`
 }
 
 const (
@@ -59,6 +64,9 @@ func Load() *Config {
 	}
 	if c.DstVersionUrl == "" {
 		c.DstVersionUrl = "http://ver.tugos.cn/getLocalVersion"
+	}
+	if c.DailyVersionCheck.Time == "" {
+		c.DailyVersionCheck.Time = "04:00"
 	}
 	Cfg = c
 	return c

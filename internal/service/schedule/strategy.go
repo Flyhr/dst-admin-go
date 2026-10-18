@@ -38,10 +38,26 @@ type UpdateStrategy struct {
 	context *StrategyContext
 }
 
+// Execute 定时更新：先停服 → SteamCMD 更新 → 再启动，避免在游戏运行时改游戏文件。
 func (s *UpdateStrategy) Execute(clusterName, uuid string) {
 	log.Printf("执行更新任务: cluster=%s, uuid=%s", clusterName, uuid)
-	if s.context != nil && s.context.UpdateService != nil {
-		s.context.UpdateService.Update(clusterName)
+	if s.context == nil || s.context.UpdateService == nil {
+		return
+	}
+	if s.context.GameProcess != nil {
+		if err := s.context.GameProcess.StopAll(clusterName); err != nil {
+			log.Printf("定时更新失败：停止世界失败: %v", err)
+			return
+		}
+	}
+	updateErr := s.context.UpdateService.Update(clusterName)
+	if updateErr != nil {
+		log.Printf("定时更新失败: %v", updateErr)
+	}
+	if s.context.GameProcess != nil {
+		if err := s.context.GameProcess.StartAll(clusterName); err != nil {
+			log.Printf("定时更新后启动世界失败: %v", err)
+		}
 	}
 }
 

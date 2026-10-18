@@ -137,8 +137,7 @@ func (p *LinuxProcess) StartAll(clusterName string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	err := p.stopAll(clusterName)
-	if err != nil {
+	if err := p.stopAll(clusterName); err != nil {
 		return err
 	}
 	config, err := p.levelConfigUtils.GetLevelConfig(clusterName)
@@ -146,25 +145,32 @@ func (p *LinuxProcess) StartAll(clusterName string) error {
 		return err
 	}
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []string
 	wg.Add(len(config.LevelList))
 	for i := range config.LevelList {
 		go func(i int) {
-			defer func() {
-				wg.Done()
-				if r := recover(); r != nil {
-					log.Println(r)
-				}
-			}()
 			levelName := config.LevelList[i].File
-			err := p.launchLevel(clusterName, levelName)
-			if err != nil {
-				log.Println(err)
-				return
+			defer func() {
+				if r := recover(); r != nil {
+					errMu.Lock()
+					errs = append(errs, fmt.Sprintf("%s: %v", levelName, r))
+					errMu.Unlock()
+				}
+				wg.Done()
+			}()
+			if launchErr := p.launchLevel(clusterName, levelName); launchErr != nil {
+				errMu.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", levelName, launchErr))
+				errMu.Unlock()
 			}
 		}(i)
 	}
 	ClearScreen()
 	wg.Wait()
+	if len(errs) > 0 {
+		return fmt.Errorf("启动世界失败: %s", strings.Join(errs, "; "))
+	}
 	return nil
 }
 
@@ -174,30 +180,40 @@ func (p *LinuxProcess) StopAll(clusterName string) error {
 	return p.stopAll(clusterName)
 }
 
-// stopAll 内部实现，不加锁，供 StartAll 等方法内部调用
+// stopAll 内部实现，不加锁，供 StartAll 等方法内部调用。
+// 必须汇总每个分片的停止结果：任何一个世界没有真正退出都要返回错误，
+// 否则更新/修复流程会在游戏仍在运行时改动游戏文件。
 func (p *LinuxProcess) stopAll(clusterName string) error {
 	config, err := p.levelConfigUtils.GetLevelConfig(clusterName)
 	if err != nil {
-		log.Panicln(err)
+		return fmt.Errorf("读取世界配置失败: %w", err)
 	}
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []string
 	wg.Add(len(config.LevelList))
 	for i := range config.LevelList {
 		go func(i int) {
-			defer func() {
-				wg.Done()
-				if r := recover(); r != nil {
-					log.Println(r)
-				}
-			}()
 			levelName := config.LevelList[i].File
-			err := p.stop(clusterName, levelName)
-			if err != nil {
-				return
+			defer func() {
+				if r := recover(); r != nil {
+					errMu.Lock()
+					errs = append(errs, fmt.Sprintf("%s: %v", levelName, r))
+					errMu.Unlock()
+				}
+				wg.Done()
+			}()
+			if stopErr := p.stop(clusterName, levelName); stopErr != nil {
+				errMu.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", levelName, stopErr))
+				errMu.Unlock()
 			}
 		}(i)
 	}
 	wg.Wait()
+	if len(errs) > 0 {
+		return fmt.Errorf("停止世界失败: %s", strings.Join(errs, "; "))
+	}
 	return nil
 }
 
